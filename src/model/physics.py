@@ -19,7 +19,10 @@ class TernaryComplexSTE(torch.autograd.Function):
 
 def quantize_ternary(w, training=True):
     w_quant = TernaryComplexSTE.apply(w, training)
-    return w + (w_quant - w).detach()
+    # Soft clamp on latent weights to bound gradient magnitudes
+    # This ensures gradients respect the scream clamp boundary
+    w_clamped = w.clamp(-1.5, 1.5)
+    return w_clamped + (w_quant - w_clamped).detach()
 
 class OctonionTernaryLinearRef(nn.Module):
     """Vectorized Octonion Layer (8x Kernel Reduction) - Reference Implementation."""
