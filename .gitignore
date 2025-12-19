@@ -12,7 +12,6 @@ venv/
 *.spinnet
 experiments/
 out/
-ckpt_v2.spinnet
 
 # Datasets (Keep scripts, ignore binaries)
 data/**/*.bin
