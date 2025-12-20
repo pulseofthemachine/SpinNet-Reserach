@@ -16,16 +16,59 @@ Comparing training with/without OctonionHeadMixer on TinyCodes dataset.
 | LR | 3e-3 |
 | Octonion Attention | A: False, B: True |
 
-## Results @ iter 200
+## Results
 
+### Early Results (iter 200)
 | Variant | Train Loss | Val Loss | Time/iter |
 |---------|------------|----------|-----------|
 | **A: Without Mixer** | 4.58 | 4.62 | 1.56s |
 | **B: With Mixer** | 4.19 | **4.26** | 2.30s |
 | **Improvement** | -8.5% | **-7.8%** | +47% |
 
-## Key Finding
-**~8% loss reduction** with octonion head mixing on code, at cost of 47% slower training.
+### Final Results (iter 5000 - With Mixer Only)
+| Step | Train Loss | Val Loss | Sparsity |
+|------|------------|----------|----------|
+| 200 | 4.19 | 4.26 | 50% |
+| 1200 | 1.88 | 2.16 | ~65% |
+| 2400 | 1.62 | 1.88 | 80% |
+| **5000** | **1.41** | **1.68** | **~85%** |
+
+## Key Findings
+
+### 1. 8% Loss Improvement
+Octonion head mixing reduced loss by ~8% compared to baseline at same iteration count.
+
+### 2. Extreme Sparsity (85%)
+Model learned to prune to 85% zeros - much higher than BitNet's 40-50%.
+
+### 3. e₀ Dominates Activations
+Real component carries 2x activation magnitude vs imaginary dimensions.
+
+### 4. Layer-wise Specialization
+Different layers use different octonion dimensions - suggests selective application.
+
+## Sample Output (Final Model)
+```python
+# PROMPT: def fibonacci(n):
+def fibonacci(n):
+    if n <= 0:
+        return 1
+    n_sum = 0
+    for i in range(0, n+1):
+        sum += i
+    return sum
+
+# PROMPT: for i in range(10):
+for i in range(10):
+    if is_prime(i) == 0:
+        primes[i] = False
+    primes = []
+    for i in range(1, len(numbers)):
+        if n % i == 0:
+            primes.append(i)
+    return primes
+```
+Syntactically structured, semantically imperfect - appropriate for 6M token training.
 
 ## Head Mixer Layer Analysis
 Most active dimensions per layer:

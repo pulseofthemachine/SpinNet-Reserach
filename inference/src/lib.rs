@@ -5,6 +5,7 @@
 mod model;
 mod octonion;
 mod attention;
+mod tokenizer;
 
 use candid::{CandidType, Deserialize};
 use ic_cdk_macros::{init, post_upgrade, query, update};

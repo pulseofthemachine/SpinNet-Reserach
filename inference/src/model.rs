@@ -4,6 +4,7 @@
 
 use crate::attention::{rms_norm, attention, attention_cached, apply_rope, silu};
 use crate::octonion::{SIGN_TABLE, WEIGHT_IDX};
+use crate::tokenizer::Tokenizer;
 
 /// SpinNet model container
 pub struct SpinNetModel {
@@ -14,8 +15,7 @@ pub struct SpinNetModel {
     final_norm: Vec<f32>,              // RMSNorm weights
     rope_cos: Vec<f32>,                // [block_size, head_dim/2]
     rope_sin: Vec<f32>,
-    stoi: [u8; 256],
-    itos: [char; 256],
+    tokenizer: Tokenizer,              // Auto-detecting tokenizer
 }
 
 #[derive(Clone)]
@@ -48,6 +48,9 @@ pub struct TransformerLayer {
     gate_proj: BitmaskWeight,
     up_proj: BitmaskWeight,
     down_proj: BitmaskWeight,
+    // Octonion head mixer (optional, for octonion_attention models)
+    head_mixer_w: Option<Vec<Vec<Vec<f32>>>>,  // [8, head_dim, head_dim]
+    head_mixer_beta: Option<Vec<f32>>,         // [head_dim]
 }
 
 /// KV Cache for efficient autoregressive generation
@@ -125,6 +128,9 @@ impl SpinNetModel {
         let mut bitmask_weights: std::collections::HashMap<String, BitmaskWeight> = std::collections::HashMap::new();
         let mut norm_weights: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
         let mut scale_weights: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+        // Head mixer weights: name -> flattened [8, D, D] or [D]
+        let mut head_mixer_w_raw: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+        let mut head_mixer_beta_raw: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
         
         // Parse all weights
         while cursor < data.len() - 4 {
@@ -247,6 +253,18 @@ impl SpinNetModel {
                         rope_sin.push(arr[i + 1]);  // imag = sin
                     }
                 }
+                b'H' => {
+                    // Head mixer weights [8, D, D] - FP16
+                    let name = read_name(data, &mut cursor)?;
+                    let arr = read_array_f16_as_f32(data, &mut cursor)?;
+                    head_mixer_w_raw.insert(name, arr);
+                }
+                b'h' => {
+                    // Head mixer beta [D] - FP16
+                    let name = read_name(data, &mut cursor)?;
+                    let arr = read_array_f16_as_f32(data, &mut cursor)?;
+                    head_mixer_beta_raw.insert(name, arr);
+                }
                 _ => {
                     // Skip unknown marker
                     if cursor < data.len() {
@@ -287,6 +305,29 @@ impl SpinNetModel {
                 norm_weights.remove(&key).unwrap_or_else(|| vec![1.0; config.n_embd])
             };
             
+            // Extract head mixer weights if present
+            let head_dim = config.n_embd / config.n_head;
+            let hm_w_key = format!("{}.attention.head_mixer.W", prefix);
+            let hm_beta_key = format!("{}.attention.head_mixer.beta", prefix);
+            
+            let head_mixer_w = head_mixer_w_raw.remove(&hm_w_key).map(|flat| {
+                // Reshape from flat [8 * D * D] to [8][D][D]
+                let mut w = vec![vec![vec![0.0f32; head_dim]; head_dim]; 8];
+                for i in 0..8 {
+                    for j in 0..head_dim {
+                        for k in 0..head_dim {
+                            let idx = i * head_dim * head_dim + j * head_dim + k;
+                            if idx < flat.len() {
+                                w[i][j][k] = flat[idx];
+                            }
+                        }
+                    }
+                }
+                w
+            });
+            
+            let head_mixer_beta = head_mixer_beta_raw.remove(&hm_beta_key);
+            
             layers.push(TransformerLayer {
                 attn_norm: get_norm("attention_norm.weight"),
                 wq: get_bitmask("attention.wq.weight"),
@@ -297,24 +338,13 @@ impl SpinNetModel {
                 gate_proj: get_bitmask("feed_forward.gate_proj.weight"),
                 up_proj: get_bitmask("feed_forward.up_proj.weight"),
                 down_proj: get_bitmask("feed_forward.down_proj.weight"),
+                head_mixer_w,
+                head_mixer_beta,
             });
         }
         
-        // Tokenizer (Shakespeare charset from meta.pkl)
-        // Note: Only contains specific characters from the dataset
-        let charset = "\n !$&',-.3:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-        let mut stoi = [0u8; 256];
-        let mut itos = [' '; 256];
-        
-        // Initialize stoi with 255 (unknown)
-        for i in 0..256 {
-            stoi[i] = 255; 
-        }
-        
-        for (i, c) in charset.chars().enumerate() {
-            stoi[c as usize % 256] = i as u8;
-            itos[i] = c;
-        }
+        // Create auto-detecting tokenizer based on vocab_size
+        let tokenizer = Tokenizer::new(config.vocab_size);
         
         // Set default embeddings if not loaded
         if embeddings.is_empty() {
@@ -338,26 +368,23 @@ impl SpinNetModel {
             final_norm,
             rope_cos,
             rope_sin,
-            stoi,
-            itos,
+            tokenizer,
         })
     }
     
     /// Tokenize a string to token IDs
     pub fn tokenize(&self, text: &str) -> Vec<usize> {
-        text.chars()
-            .map(|c| self.stoi[c as usize % 256] as usize)
-            .collect()
+        self.tokenizer.tokenize(text)
     }
     
-    /// Decode a single token to character
+    /// Decode a single token to string
     pub fn decode_token(&self, token: usize) -> String {
-        self.itos[token % 256].to_string()
+        self.tokenizer.decode_token(token)
     }
     
     /// Decode multiple tokens to string  
     pub fn decode_tokens(&self, tokens: &[usize]) -> String {
-        tokens.iter().map(|&t| self.itos[t % 256]).collect()
+        self.tokenizer.decode_tokens(tokens)
     }
     
     /// Single forward pass returning next token (for chunked generation)
@@ -381,7 +408,7 @@ impl SpinNetModel {
             logits[v] = dot;
         }
         
-        argmax(&logits)
+        sample_with_temperature(&logits, 0.8)
     }
     
     /// Embed tokens to hidden states (first step of chunked forward)
@@ -453,7 +480,12 @@ impl SpinNetModel {
         let v_full = &cache.v_cache[layer_idx];
         
         // Attention: new Q attends to full K,V
-        let attn_out = attention_cached(&q_new, k_full, v_full, new_len, full_len, n_head, head_dim);
+        let mut attn_out = attention_cached(&q_new, k_full, v_full, new_len, full_len, n_head, head_dim);
+        
+        // Apply head mixer if present (octonion attention mixing)
+        if let (Some(ref w), Some(ref beta)) = (&layer.head_mixer_w, &layer.head_mixer_beta) {
+            attn_out = self.apply_head_mixer(&attn_out, w, beta, new_len, n_head, head_dim);
+        }
         
         // Output projection
         let o = self.bitmask_matmul(&attn_out, &layer.wo, new_len, n_embd, n_embd);
@@ -487,6 +519,68 @@ impl SpinNetModel {
         
         h
     }
+    
+    /// Apply octonion head mixer using Cayley-Dickson algebra
+    /// Mixes 8 attention heads using learned weight matrices
+    fn apply_head_mixer(
+        &self,
+        attn_out: &[f32],  // [new_len * n_embd]
+        w: &[Vec<Vec<f32>>],  // [8][head_dim][head_dim]
+        beta: &[f32],  // [head_dim]
+        new_len: usize,
+        n_head: usize,
+        head_dim: usize,
+    ) -> Vec<f32> {
+        use crate::octonion::{SIGN_TABLE, WEIGHT_IDX};
+        
+        let n_embd = n_head * head_dim;
+        let mut y = vec![0.0f32; new_len * n_embd];
+        
+        // Process each token position
+        for t in 0..new_len {
+            // Extract 8 head inputs for this position: x[h] = attn_out[t * n_embd + h * head_dim .. +head_dim]
+            let base = t * n_embd;
+            
+            // For each output head
+            for i in 0..8 {
+                let y_base = base + i * head_dim;
+                
+                // Sum over 8 input heads with Cayley-Dickson structure
+                for j in 0..8 {
+                    let sign = SIGN_TABLE[i][j] as f32;
+                    let w_idx = WEIGHT_IDX[i][j];
+                    
+                    let x_base = base + j * head_dim;
+                    
+                    // y[i] += sign * x[j] @ W[w_idx]
+                    // PyTorch: y[k] = sum_j x[j] * W[j][k]
+                    for d_out in 0..head_dim {
+                        let mut dot = 0.0f32;
+                        for d_in in 0..head_dim {
+                            let x_val = attn_out.get(x_base + d_in).copied().unwrap_or(0.0);
+                            // W is [8][head_dim][head_dim], indexed as W[part][row][col]
+                            // For x @ W: y[d_out] = sum_d_in x[d_in] * W[d_in][d_out]
+                            let w_val = w.get(w_idx)
+                                .and_then(|m| m.get(d_in))
+                                .and_then(|row| row.get(d_out))
+                                .copied()
+                                .unwrap_or(0.0);
+                            dot += x_val * w_val;
+                        }
+                        y[y_base + d_out] += sign * dot;
+                    }
+                }
+                
+                // Apply beta scaling
+                for d in 0..head_dim {
+                    let b = beta.get(d).copied().unwrap_or(1.0);
+                    y[y_base + d] *= b;
+                }
+            }
+        }
+        
+        y
+    }
 
     /// Final normalization and sample next token (last step of chunked forward)
     pub fn final_norm_and_sample(&self, hidden: &[f32], seq_len: usize) -> usize {
@@ -513,13 +607,11 @@ impl SpinNetModel {
             logits[v] = dot;
         }
         
-        argmax(&logits)
+        sample_with_temperature(&logits, 0.8)
     }
     
     pub fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String, String> {
-        let mut tokens: Vec<usize> = prompt.chars()
-            .map(|c| self.stoi[c as usize % 256] as usize)
-            .collect();
+        let mut tokens: Vec<usize> = self.tokenize(prompt);
         
         for _ in 0..max_tokens {
             if tokens.len() >= self.config.block_size {
@@ -527,20 +619,18 @@ impl SpinNetModel {
             }
             
             let logits = self.forward(&tokens);
-            let next_token = argmax(&logits);
+            let next_token = sample_with_temperature(&logits, 0.8);
             tokens.push(next_token);
         }
         
-        Ok(tokens.iter().map(|&t| self.itos[t % 256]).collect())
+        Ok(self.decode_tokens(&tokens))
     }
     
     /// Simple generation using embeddings only (fast, for query calls)
     pub fn generate_simple(&self, prompt: &str, max_tokens: usize) -> Result<String, String> {
         let n_embd = self.config.n_embd;
         
-        let mut tokens: Vec<usize> = prompt.chars()
-            .map(|c| self.stoi[c as usize % 256] as usize)
-            .collect();
+        let mut tokens: Vec<usize> = self.tokenize(prompt);
         
         for _ in 0..max_tokens {
             if tokens.len() >= self.config.block_size {
@@ -565,11 +655,11 @@ impl SpinNetModel {
                 logits[v] = dot;
             }
             
-            let next_token = argmax(&logits);
+            let next_token = sample_with_temperature(&logits, 0.8);
             tokens.push(next_token);
         }
         
-        Ok(tokens.iter().map(|&t| self.itos[t % 256]).collect())
+        Ok(self.decode_tokens(&tokens))
     }
     
     fn forward(&self, tokens: &[usize]) -> Vec<f32> {
@@ -633,7 +723,12 @@ impl SpinNetModel {
         self.apply_rope(&mut q, &mut k, seq_len, head_dim);
         
         // Attention
-        let attn_out = attention(&q, &k, &v, n_head, head_dim);
+        let mut attn_out = attention(&q, &k, &v, n_head, head_dim);
+        
+        // Apply head mixer if present (octonion attention mixing)
+        if let (Some(ref w), Some(ref beta)) = (&layer.head_mixer_w, &layer.head_mixer_beta) {
+            attn_out = self.apply_head_mixer(&attn_out, w, beta, seq_len, n_head, head_dim);
+        }
         
         // Output projection
         let o = self.bitmask_matmul(&attn_out, &layer.wo, seq_len, n_embd, n_embd);
@@ -1075,3 +1170,62 @@ fn argmax(arr: &[f32]) -> usize {
         .map(|(i, _)| i)
         .unwrap_or(0)
 }
+
+/// Simple LCG random number generator (deterministic seeded RNG for ICP)
+/// Uses the MINSTD parameters
+thread_local! {
+    static RNG_STATE: std::cell::RefCell<u64> = std::cell::RefCell::new(12345);
+}
+
+fn rand_u64() -> u64 {
+    RNG_STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        // LCG: x' = (a * x + c) mod m
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *s
+    })
+}
+
+fn rand_f32() -> f32 {
+    (rand_u64() >> 40) as f32 / (1u64 << 24) as f32
+}
+
+/// Seed the RNG (call with time or counter for non-determinism)
+pub fn seed_rng(seed: u64) {
+    RNG_STATE.with(|state| {
+        *state.borrow_mut() = seed;
+    });
+}
+
+/// Sample from logits with temperature
+/// temperature = 0.0 -> greedy (argmax)
+/// temperature = 1.0 -> standard softmax sampling
+/// temperature > 1.0 -> more random
+pub fn sample_with_temperature(logits: &[f32], temperature: f32) -> usize {
+    if temperature <= 0.0 || logits.is_empty() {
+        return argmax(logits);
+    }
+    
+    // Apply temperature scaling
+    let scaled: Vec<f32> = logits.iter().map(|&x| x / temperature).collect();
+    
+    // Compute softmax
+    let max_val = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let exp_vals: Vec<f32> = scaled.iter().map(|&x| (x - max_val).exp()).collect();
+    let sum: f32 = exp_vals.iter().sum();
+    let probs: Vec<f32> = exp_vals.iter().map(|&x| x / sum).collect();
+    
+    // Sample from distribution
+    let r = rand_f32();
+    let mut cumsum = 0.0f32;
+    for (i, &p) in probs.iter().enumerate() {
+        cumsum += p;
+        if r < cumsum {
+            return i;
+        }
+    }
+    
+    // Fallback to last token
+    probs.len() - 1
+}
+

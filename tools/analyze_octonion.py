@@ -92,7 +92,8 @@ def analyze_head_mixer(model):
     
     mixers = []
     for name, module in model.named_modules():
-        if type(module).__name__ == 'OctonionHeadMixer':
+        # Check for both pure PyTorch and fused CUDA versions
+        if type(module).__name__ in ('OctonionHeadMixer', 'OctonionHeadMixerFused'):
             mixers.append((name, module))
     
     if not mixers:

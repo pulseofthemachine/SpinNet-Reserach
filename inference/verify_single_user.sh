@@ -1,11 +1,12 @@
 #!/bin/bash
 # Verify single-user functionality with generate_n_tokens
+# Updated for TinyStories (GPT-2 tokenizer) model
 # Usage: ./verify_single_user.sh ["Prompt"] [N]
 
-PROMPT="${1:-To be or not to be}"
-N="${2:-100}"
+PROMPT="${1:-Once upon a time}"
+N="${2:-50}"
 
-echo "Testing Single-User Mode (Singleton Refactor)"
+echo "Testing Single-User Mode (TinyStories GPT-2)"
 echo "Prompt: $PROMPT"
 echo "Target: $N tokens"
 echo ""
@@ -23,7 +24,7 @@ dfx canister call spinnet_backend start_forward
 echo "Processing prompt layers..."
 STATUS="Layer"
 while [[ "$STATUS" != *"Done"* ]]; do
-  STATUS=$(dfx canister call spinnet_backend process_layers '(24)')
+  STATUS=$(dfx canister call spinnet_backend process_layers '(8)')
   echo "  $STATUS"
   
   if [[ "$STATUS" == *"Error"* ]]; then
@@ -53,7 +54,8 @@ while [ $GENERATED -lt $N ]; do
     # Extract just the text (remove candid wrapping)
     CHUNK=$(echo "$RAW" | sed 's/(\"//;s/\")//;s/\\n/\n/g')
     
-    # Count characters (each char = 1 token for Shakespeare model)
+    # For GPT-2, count tokens by looking at response structure
+    # (Each call returns decoded string, not individual chars)
     CHUNK_LEN=${#CHUNK}
     
     if [ $CHUNK_LEN -eq 0 ]; then
@@ -62,25 +64,28 @@ while [ $GENERATED -lt $N ]; do
     fi
     
     TOTAL_OUTPUT+="$CHUNK"
-    GENERATED=$((GENERATED + CHUNK_LEN))
-    echo "  Generated $CHUNK_LEN tokens (total: $GENERATED/$N)"
+    # Estimate tokens (GPT-2 averages ~4 chars per token)
+    TOKEN_ESTIMATE=$((CHUNK_LEN / 4))
+    [ $TOKEN_ESTIMATE -eq 0 ] && TOKEN_ESTIMATE=1
+    GENERATED=$((GENERATED + TOKEN_ESTIMATE))
+    echo "  Generated ~$TOKEN_ESTIMATE tokens (total: ~$GENERATED/$N)"
 done
 
 BURST_END=$(date +%s.%N)
 
 # Calculate stats
 DURATION=$(echo "$BURST_END - $BURST_START" | bc)
-TPS=$(echo "scale=2; ($GENERATED - 1) / $DURATION" | bc)
+TPS=$(echo "scale=2; ($GENERATED - 1) / $DURATION" | bc 2>/dev/null || echo "N/A")
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
-echo "OUTPUT ($GENERATED tokens):"
+echo "OUTPUT (~$GENERATED tokens):"
 echo "═══════════════════════════════════════════════════════════════"
 echo "$TOTAL_OUTPUT"
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "STATS:"
-echo "  Total tokens: $GENERATED"
+echo "  Estimated tokens: $GENERATED"
 echo "  Duration: ${DURATION}s"
 echo "  Speed: $TPS tok/s"
 echo "═══════════════════════════════════════════════════════════════"

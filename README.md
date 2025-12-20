@@ -22,8 +22,9 @@ Standard LLMs treat dimensions as independent. We suspect that forcing dimension
 Built on PyTorch. Use this to train models.
 
 - **Octonion Linear Layers**: Implements `y = x @ W^T` using the 8x8 Cayley-Dickson sign table.
-- **Fused Triton Kernels**: ~6x speedup over PyTorch.
-  - Implements a custom autograd function that fuses the 64-term Octonion algebra into a single kernel launch, maintaining FP32 accumulation for stability while storing Int8 weights.
+- **Octonion Head Mixer**: Mixes 8 attention heads using Cayley-Dickson algebra for improved representation learning (~8% loss reduction).
+- **Fused Triton Kernels**: ~6x speedup for linear layers, ~46x speedup for head mixer.
+  - Custom autograd functions that fuse the Octonion algebra into a single kernel launch.
 
 **Quick Start: Training**
 
@@ -32,8 +33,8 @@ Built on PyTorch. Use this to train models.
     # Option A: TinyShakespeare (Fastest, good for testing)
     python data/tinyshakespeare/prepare.py
     
-    # Option B: Crypto (Custom domain data)
-    python data/crypto/prepare.py
+    # Option B: TinyStories (Children's stories, 50k vocab)
+    python data/tinystories/prepare.py
     
     # Option C: FineWeb (High quality, for larger models)
     python data/fineweb/prepare.py
@@ -44,45 +45,83 @@ Built on PyTorch. Use this to train models.
     # Train small Shakespeare model
     python train.py config/train_tinyshakespeare.py
     
+    # Train TinyStories with Octonion Head Mixer
+    python train.py config/train_tinystories_octonion.py
+    
     # Train 124M parameter model (GPT-2 Small scale)
     python train.py config/scholar_124m.py
-    
-    # Train Crypto model
-    python train.py config/train_crypto.py
     ```
 
-**Note**: The system *automatically* detects if you are running on CUDA and switches to the Fused Triton Kernel for maximum speed.
+3.  **Analyze Octonion Structure**: Visualize dimension specialization.
+    ```bash
+    python tools/analyze_octonion.py --ckpt experiments/out-tinystories-octonion/ckpt.pt
+    ```
+
+**Note**: The system *automatically* detects CUDA and switches to Fused Triton Kernels.
 
 ### 2. Rust / Wasm Inference Engine (`inference/`)
 A bare-metal inference engine designed for the **DFINITY Internet Computer (IC)**. It runs entirely in WebAssembly within ICP's 40B instruction limits.
 
-- **Weights**: Parses custom `.spinnet` sparse-ternary format.
-- **Execution**: Splits the Forward pass into adaptive chunks based on real-time instruction monitoring.
-- **KV Cache**: Implemented incremental attention (O(1) complexity per token).
-- **Storage Optimization**: Hybrid **Bitmask Format** (v4) reduces model size by **14%** compared to v2 while enabling sparse iteration (skipping zero weights).
-- **Adaptive Chunking**: Automatically pauses layer processing at 60% instruction budget, resuming on next call. Works with any model size.
-- **Performance (3.2M param model)**: **1.73 tok/s** sustained over 100 tokens on ICP subnet.
-
-**Usage (IC Replica)**:
-```bash
-cd inference
-dfx deploy
-./verify_single_user.sh "To be or not to be" 100
-```
+- **Weights**: Parses custom `.spinnet` sparse-ternary format with Octonion Head Mixer support.
+- **Tokenizer**: Auto-detecting (char-level for vocab≤256, GPT-2 BPE otherwise).
+- **Head Mixer**: Full Cayley-Dickson algebra implementation for attention mixing.
+- **KV Cache**: Incremental attention (O(1) complexity per token).
+- **Temperature Sampling**: Softmax with T=0.8 for diverse generation.
+- **Adaptive Chunking**: Automatically pauses at 60% instruction budget.
 
 ---
 
-## 📊 Current Status (The "Shat" Report)
+## 🚀 ICP Canister Deployment
 
-We have verified **mechanical correctness** across the stack.
-- The Python model trains and reduces loss.
-- The Rust engine produces mathematically identical outputs to the Python reference.
+### Prerequisites
+- Install [dfx](https://internetcomputer.org/docs/current/developer-docs/setup/install/)
+- Have a trained model checkpoint
 
-**However**, the current checkpoint (`ckpt_v2.spinnet`) is trained on a tiny dataset (TinyShakespeare) for a very short time.
-- **Expected Output**: "To be or not to be..."
-- **Actual Output**: "To be or not to se the shat t..."
+### Deploy to Local Replica
 
-*Note: We are optimizing the **Engine** first. The **Model Intelligence** (fixing "the shat") is next on the roadmap.*
+1.  **Compress the model**:
+    ```bash
+    python compress.py experiments/out-tinystories-octonion/ckpt.pt --output inference/ckpt_v2.spinnet
+    ```
+
+2.  **Start the replica and deploy**:
+    ```bash
+    cd inference
+    dfx start --background
+    dfx deploy
+    ```
+
+3.  **Test with verify script**:
+    ```bash
+    ./verify_single_user.sh "Once upon a time" 50
+    ```
+    
+    Expected output (TinyStories):
+    ```
+    Once upon a time, there was a little girl named Lily. 
+    She liked to play outside and play with her friends...
+    ```
+
+### API Endpoints
+- `start_generation(prompt, max_tokens)` - Begin generation session
+- `start_forward()` - Initialize forward pass
+- `process_layers(n)` - Process n layers (adaptive chunking)
+- `finish_forward()` - Sample next token
+- `generate_n_tokens(n)` - Generate up to n tokens in one call
+
+---
+
+## 📊 Current Status
+
+### Verified Working
+- ✅ **Coherent Text Generation**: TinyStories produces children's story text
+- ✅ **Octonion Head Mixer**: Reduces loss by ~8% vs baseline
+- ✅ **ICP Deployment**: ~0.7 tok/s on local replica
+
+### Recent Improvements
+- **GPT-2 Tokenizer**: Rust inference now supports 50k vocab models
+- **Head Mixer in Rust**: Full Cayley-Dickson implementation matching Python
+- **Temperature Sampling**: More diverse output (no more greedy loops)
 
 ---
 
@@ -90,21 +129,25 @@ We have verified **mechanical correctness** across the stack.
 
 ### Phase 1: Engine Optimization (✅ Complete)
 - [x] Implement Octonion logic in PyTorch
-- [x] Write Fused Triton Kernels
-- [x] Port inference to Rust/Wasm
-- [x] Implement KV Cache & Flash Attention equivalent
-- [x] Implement generate_n_tokens to generate ~50 tokens in a single update call
+- [x] Write Fused Triton Kernels (linear + head mixer)
+- [x] Port inference to Rust/Wasm with head mixer
+- [x] Implement KV Cache & incremental attention
+- [x] Implement GPT-2 tokenizer in Rust
+- [x] Add temperature sampling
 
 ### Phase 2: Deployment & UX (🚧 In Progress)
-- [ ] **Client-Side Wasm**: Port the Rust engine to run directly in the browser (via `wasm-bindgen`) for use with larger models that would be too slow to run on the IC, respecting current instruction limits.
-- [ ] **Web Dashboard**: Visualizer for the hyper-dimensional states.
-- [ ] **Data Quality**: Train a 100M+ param model on FineWeb-Edu to produce coherent English.
-- [.] **Mainnet**: Deploy the canister to the live IC network.
+- [ ] **Client-Side Wasm**: Port to browser via `wasm-bindgen`
+- [ ] **Web Dashboard**: Visualizer for hyper-dimensional states
+- [ ] **Data Quality**: Train 100M+ param model on FineWeb-Edu
+- [.] **Mainnet**: Deploy canister to live IC network
 
 ---
 
 ## 📂 Key Files
-- `src/model/cayley_dickson_cuda.py`: The high-performance CUDA kernel.
-- `inference/src/model.rs`: The Rust Wasm inference logic.
-- `inference/src/lib.rs`: The IC Canister API (Session Manager).
-- `compress.py`: Tool to convert PyTorch `.pt` -> `.spinnet` format.
+- `src/model/cayley_dickson_cuda.py`: High-performance CUDA kernels (linear + head mixer)
+- `src/model/chassis.py`: Model architecture with Octonion Head Mixer
+- `inference/src/model.rs`: Rust Wasm inference with head mixer
+- `inference/src/tokenizer.rs`: Auto-detecting GPT-2/char tokenizer
+- `inference/src/lib.rs`: IC Canister API (Session Manager)
+- `compress.py`: Convert PyTorch `.pt` -> `.spinnet` format
+- `tools/analyze_octonion.py`: Analyze dimension specialization

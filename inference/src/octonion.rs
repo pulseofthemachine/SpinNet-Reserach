@@ -114,3 +114,72 @@ pub struct TernaryWeight {
     pub signs: Vec<i8>,
     pub shape: Vec<usize>,  // [8, N, K] for octonion
 }
+
+/// Dense weight matrix for head mixer (not ternary for now)
+pub struct HeadMixerWeights {
+    pub w: Vec<Vec<Vec<f32>>>,  // [8, D, D]
+    pub beta: Vec<f32>,         // [D]
+    pub head_dim: usize,
+}
+
+/// Dense matrix-vector multiplication for a single head
+fn dense_matvec(x: &[f32], w: &[Vec<f32>]) -> Vec<f32> {
+    let d = w.len();
+    let mut y = vec![0.0f32; d];
+    for i in 0..d {
+        for (j, &xj) in x.iter().enumerate() {
+            y[i] += w[i][j] * xj;
+        }
+    }
+    y
+}
+
+/// Head mixer forward pass
+///
+/// Mixes 8 attention heads using Cayley-Dickson algebra.
+/// y_i = sum_j (sign[i][j] * x_j @ W[widx[i][j]]) * beta
+pub fn head_mixer_forward(
+    x_heads: &[Vec<f32>; 8],  // 8 head outputs, each [T * D]
+    weights: &HeadMixerWeights,
+    seq_len: usize,
+) -> [Vec<f32>; 8] {
+    let d = weights.head_dim;
+    let mut y_heads: [Vec<f32>; 8] = std::array::from_fn(|_| vec![0.0; seq_len * d]);
+    
+    // Process each token position
+    for t in 0..seq_len {
+        let start = t * d;
+        let end = start + d;
+        
+        // Extract input for this position
+        let x_t: [Vec<f32>; 8] = std::array::from_fn(|h| {
+            x_heads[h][start..end].to_vec()
+        });
+        
+        // For each output head
+        for i in 0..8 {
+            let mut acc = vec![0.0f32; d];
+            
+            // Sum over 8 input heads
+            for j in 0..8 {
+                let sign = SIGN_TABLE[i][j] as f32;
+                let w_idx = WEIGHT_IDX[i][j];
+                
+                // x_t[j] @ W[w_idx]
+                let contrib = dense_matvec(&x_t[j], &weights.w[w_idx]);
+                
+                for k in 0..d {
+                    acc[k] += sign * contrib[k];
+                }
+            }
+            
+            // Apply beta scaling and store
+            for k in 0..d {
+                y_heads[i][start + k] = acc[k] * weights.beta[k];
+            }
+        }
+    }
+    
+    y_heads
+}
+

@@ -214,8 +214,8 @@ def compress_model(checkpoint_path: str, output_path: str, vocab_path: str = Non
                 
                 ternary_count += 1
                 
-            elif '.beta' in name:
-                # Learnable scale (beta) - FP16
+            elif '.beta' in name and 'head_mixer' not in name:
+                # Learnable scale (beta) - FP16 (but not head_mixer.beta, handled separately)
                 print(f"  [SCALE] {name}: {param_data.shape}")
                 f.write(b'S')
                 name_bytes = name.encode('utf-8')
@@ -243,6 +243,24 @@ def compress_model(checkpoint_path: str, output_path: str, vocab_path: str = Non
                 # Store as real/imag pairs
                 rope_data = torch.view_as_real(param_data).to(torch.float32).numpy()
                 write_array(f, rope_data, 'f32')
+                
+            elif 'head_mixer.W' in name:
+                # Head mixer weights - FP16 [8, D, D]
+                print(f"  [HEAD_MIXER] {name}: {param_data.shape}")
+                f.write(b'H')  # Head mixer marker
+                name_bytes = name.encode('utf-8')
+                f.write(struct.pack('<H', len(name_bytes)))
+                f.write(name_bytes)
+                write_array(f, param_data.to(torch.float16).numpy(), 'f16')
+                
+            elif 'head_mixer.beta' in name:
+                # Head mixer beta - FP16 [D]
+                print(f"  [HEAD_MIXER_BETA] {name}: {param_data.shape}")
+                f.write(b'h')  # Head mixer beta marker
+                name_bytes = name.encode('utf-8')
+                f.write(struct.pack('<H', len(name_bytes)))
+                f.write(name_bytes)
+                write_array(f, param_data.to(torch.float16).numpy(), 'f16')
                 
             else:
                 print(f"  [SKIP] {name}: {param_data.shape}")

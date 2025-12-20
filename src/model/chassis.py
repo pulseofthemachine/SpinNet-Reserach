@@ -8,6 +8,14 @@ from torch.utils.checkpoint import checkpoint
 # For inference, see cayley_dickson_cuda.py
 from .physics import OctonionTernaryLinear
 
+# Use fused head mixer on CUDA, pure PyTorch otherwise
+_USE_FUSED_HEAD_MIXER = torch.cuda.is_available()
+if _USE_FUSED_HEAD_MIXER:
+    try:
+        from .cayley_dickson_cuda import OctonionHeadMixerFused
+    except ImportError:
+        _USE_FUSED_HEAD_MIXER = False
+
 @dataclass
 class SpinNetConfig:
     block_size: int = 256
@@ -112,8 +120,8 @@ class OctonionHeadMixer(nn.Module):
                 sign = self.signs[i, j]
                 w_idx = self.widx[i, j]
                 # heads[j]: [B, T, D], W[w_idx]: [D, D]
-                acc = acc + sign * (heads[j] @ self.W[w_idx])
-            outputs.append(acc * self.beta)
+                acc = acc + sign * (heads[j] @ self.W[w_idx].to(x.dtype))
+            outputs.append(acc * self.beta.to(x.dtype))
         
         # Stack back to [B, 8, T, D]
         return torch.stack(outputs, dim=1)
@@ -135,7 +143,11 @@ class CausalSelfAttention(nn.Module):
         # Octonion head mixer (only if enabled and n_head is multiple of 8)
         if self.octonion_attention:
             assert config.n_head % 8 == 0, f"octonion_attention requires n_head % 8 == 0, got {config.n_head}"
-            self.head_mixer = OctonionHeadMixer(self.head_dim)
+            # Use fused CUDA kernel when available
+            if _USE_FUSED_HEAD_MIXER:
+                self.head_mixer = OctonionHeadMixerFused(self.head_dim)
+            else:
+                self.head_mixer = OctonionHeadMixer(self.head_dim)
 
     def forward(self, x, freqs_cis):
         B, T, C = x.size()
