@@ -35,6 +35,7 @@ n_head = 12
 n_embd = 768
 dropout = 0.0
 bias = False 
+octonion_attention = False  # Enable octonion head mixing
 
 # AdamW
 learning_rate = 6e-4 

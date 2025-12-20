@@ -124,8 +124,8 @@ def analyze_activations(model, device='cuda'):
     
     enc = tiktoken.get_encoding('gpt2')
     
-    # Test prompts with clear word types
-    test_cases = {
+    # Language categories (for TinyStories)
+    language_cases = {
         'nouns': ['The cat', 'The dog', 'A house', 'The tree', 'The boy', 'A girl'],
         'verbs': ['She runs', 'He jumps', 'They walk', 'It falls', 'We play', 'I think'],
         'adjectives': ['very big', 'so small', 'too fast', 'quite slow', 'really happy'],
@@ -137,6 +137,23 @@ def analyze_activations(model, device='cuda'):
         'story_start': ['Once upon', 'One day', 'There was', 'Long ago', 'A little'],
         'dialogue': ['he said', 'she asked', 'they replied', 'mom said', 'friend asked'],
     }
+    
+    # Code categories (for TinyCodes)
+    code_cases = {
+        'functions': ['def foo(', 'def main(', 'def get_', 'def set_', 'def calculate'],
+        'returns': ['return x', 'return None', 'return True', 'return result', 'return []'],
+        'loops': ['for i in', 'for x in', 'while True', 'while i <', 'for _ in'],
+        'conditionals': ['if x ==', 'if x >', 'else:', 'elif x', 'if not'],
+        'variables': ['x = 5', 'y = 10', 'name = "', 'result = ', 'count = 0'],
+        'operators': ['x + y', 'x - y', 'x * y', 'x / y', 'x == y'],
+        'imports': ['import numpy', 'import os', 'from x import', 'import json', 'import sys'],
+        'classes': ['class Foo:', 'class Bar:', 'self.x', 'def __init__', 'super().__init__'],
+        'lists': ['[1, 2, 3]', 'x.append(', 'len(x)', 'x[0]', 'list(x)'],
+        'strings': ['"hello"', "'world'", 'f"x={x}"', 'str(x)', '.format('],
+    }
+    
+    # Auto-detect which to use based on model (or use both)
+    test_cases = {**language_cases, **code_cases}
     
     # Hook to capture activations after first layer
     activations = {}
