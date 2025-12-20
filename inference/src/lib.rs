@@ -189,7 +189,8 @@ fn start_forward() -> String {
 #[update]
 fn process_layers(count: u32) -> String {
     // Adaptive chunking: monitor instruction usage
-    const MAX_INSTRUCTIONS: u64 = 2_000_000_000;  // Safe threshold (ICP limit is higher)
+    const MAX_INSTRUCTIONS: u64 = 40_000_000_000;  // ICP limit
+    const SAFE_THRESHOLD: u64 = MAX_INSTRUCTIONS * 60 / 100;  // 60% = conservative for prompt processing
     let start_counter = ic_cdk::api::performance_counter(0);
     
     let result = MODEL.with(|m| {
@@ -216,7 +217,7 @@ fn process_layers(count: u32) -> String {
                                     
                                     // Adaptive: Check instruction usage before processing next layer
                                     let used = ic_cdk::api::performance_counter(0) - start_counter;
-                                    if used > MAX_INSTRUCTIONS * 80 / 100 {
+                                    if used > SAFE_THRESHOLD {
                                         // Approaching limit, pause and let caller retry
                                         return format!("Paused at layer {} ({}% budget)", 
                                             state.layer_idx, 
@@ -250,7 +251,7 @@ fn process_layers(count: u32) -> String {
                                     
                                     // Adaptive: Check instruction usage
                                     let used = ic_cdk::api::performance_counter(0) - start_counter;
-                                    if used > MAX_INSTRUCTIONS * 80 / 100 {
+                                    if used > SAFE_THRESHOLD {
                                         return format!("Paused at layer {} ({}% budget)", 
                                             state.layer_idx, 
                                             used * 100 / MAX_INSTRUCTIONS);
@@ -397,9 +398,14 @@ fn generate_next_token() -> String {
 }
 
 /// Generate N tokens in a single call for maximum single-session throughput
-/// This reduces round-trip overhead by generating multiple tokens per update call
+/// Includes adaptive instruction monitoring - returns partial results if approaching limit
 #[update]
 fn generate_n_tokens(n: u32) -> String {
+    // Adaptive: use a lower threshold (60%) since each token processes all layers
+    const MAX_INSTRUCTIONS: u64 = 40_000_000_000;  // ICP limit
+    const SAFE_THRESHOLD: u64 = MAX_INSTRUCTIONS * 60 / 100;  // 60% = leave room for one more token
+    let start_counter = ic_cdk::api::performance_counter(0);
+    
     MODEL.with(|m| {
         let model_ref = m.borrow();
         match model_ref.as_ref() {
@@ -417,8 +423,16 @@ fn generate_n_tokens(n: u32) -> String {
                                 let mut result = String::new();
                                 let tokens_remaining = gen_state.max_tokens.saturating_sub(gen_state.generated_count);
                                 let tokens_to_generate = std::cmp::min(n, tokens_remaining as u32);
+                                let mut generated_in_call = 0u32;
                                 
                                 for _ in 0..tokens_to_generate {
+                                    // Adaptive: Check budget BEFORE generating next token
+                                    let used = ic_cdk::api::performance_counter(0) - start_counter;
+                                    if used > SAFE_THRESHOLD && generated_in_call > 0 {
+                                        // Generated at least one token, pause to avoid hitting limit
+                                        break;
+                                    }
+                                    
                                     // Get last token to embed
                                     let last_token = gen_state.tokens.last().copied().unwrap_or(0);
                                     let hidden = model.embed_tokens(&[last_token]);
@@ -440,6 +454,7 @@ fn generate_n_tokens(n: u32) -> String {
                                     let next_token = model.final_norm_and_sample(&curr_hidden, 1);
                                     gen_state.tokens.push(next_token);
                                     gen_state.generated_count += 1;
+                                    generated_in_call += 1;
                                     
                                     // Decode and append to result
                                     result.push_str(&model.decode_token(next_token));

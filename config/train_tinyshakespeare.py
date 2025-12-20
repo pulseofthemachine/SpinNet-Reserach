@@ -17,7 +17,7 @@ block_size = 512
 # Tiny Model (Fits in any GPU, fast iteration)
 n_layer = 8
 n_head = 8
-n_embd = 256  # Must be divisible by 8 for octonions
+n_embd = 512  # Must be divisible by 8 for octonions
 
 dropout = 0.0
 bias = False

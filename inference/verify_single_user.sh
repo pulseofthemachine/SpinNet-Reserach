@@ -1,27 +1,30 @@
 #!/bin/bash
 # Verify single-user functionality with generate_n_tokens
-# Usage: ./verify_single_user.sh "Prompt" [N]
+# Usage: ./verify_single_user.sh ["Prompt"] [N]
 
 PROMPT="${1:-To be or not to be}"
-N="${2:-50}"
+N="${2:-100}"
 
 echo "Testing Single-User Mode (Singleton Refactor)"
 echo "Prompt: $PROMPT"
+echo "Target: $N tokens"
+echo ""
 
 # 1. Start Generation
 echo "Starting generation..."
-dfx canister call spinnet_backend start_generation "(\"$PROMPT\", $((N+10)))"
+START_RESULT=$(dfx canister call spinnet_backend start_generation "(\"$PROMPT\", $((N+10)))")
+echo "$START_RESULT"
 
 # 2. Start Forward (Prompt)
 echo "Start forward..."
 dfx canister call spinnet_backend start_forward
 
-# 3. Process Layers (Prompt)
+# 3. Process Layers (Prompt) - loop until done
 echo "Processing prompt layers..."
 STATUS="Layer"
 while [[ "$STATUS" != *"Done"* ]]; do
-  STATUS=$(dfx canister call spinnet_backend process_layers '(8)')
-  echo "Status: $STATUS"
+  STATUS=$(dfx canister call spinnet_backend process_layers '(24)')
+  echo "  $STATUS"
   
   if [[ "$STATUS" == *"Error"* ]]; then
       echo "Error in processing layers!"
@@ -31,21 +34,53 @@ done
 
 # 4. Finish Forward (Sample first token)
 echo "Finish forward (First token)..."
-TOKEN=$(dfx canister call spinnet_backend finish_forward)
-echo "Token 1: $TOKEN"
+FIRST_TOKEN=$(dfx canister call spinnet_backend finish_forward | sed 's/(\"//;s/\")//')
+echo "Token 1: $FIRST_TOKEN"
 
-# 5. Generate N Tokens (Burst)
-echo "Generating $N tokens in burst..."
-START=$(date +%s.%N)
-BURST=$(dfx canister call spinnet_backend generate_n_tokens "($N)")
-END=$(date +%s.%N)
+# 5. Generate N Tokens with Adaptive Looping
+echo ""
+echo "Generating $N tokens (adaptive chunking)..."
+TOTAL_OUTPUT="$FIRST_TOKEN"
+GENERATED=1
+BURST_START=$(date +%s.%N)
 
-# Clean output
-CLEAN_BURST=$(echo "$BURST" | sed 's/("\|")//g' | sed 's/\\n/\n/g')
-echo "Burst Output: $CLEAN_BURST"
+while [ $GENERATED -lt $N ]; do
+    REMAINING=$((N - GENERATED))
+    
+    # Request remaining tokens (will get partial if budget exceeded)
+    RAW=$(dfx canister call spinnet_backend generate_n_tokens "($REMAINING)")
+    
+    # Extract just the text (remove candid wrapping)
+    CHUNK=$(echo "$RAW" | sed 's/(\"//;s/\")//;s/\\n/\n/g')
+    
+    # Count characters (each char = 1 token for Shakespeare model)
+    CHUNK_LEN=${#CHUNK}
+    
+    if [ $CHUNK_LEN -eq 0 ]; then
+        echo "  [No tokens returned, breaking]"
+        break
+    fi
+    
+    TOTAL_OUTPUT+="$CHUNK"
+    GENERATED=$((GENERATED + CHUNK_LEN))
+    echo "  Generated $CHUNK_LEN tokens (total: $GENERATED/$N)"
+done
 
-DURATION=$(echo "$END - $START" | bc)
-TPS=$(echo "scale=2; $N / $DURATION" | bc)
+BURST_END=$(date +%s.%N)
+
+# Calculate stats
+DURATION=$(echo "$BURST_END - $BURST_START" | bc)
+TPS=$(echo "scale=2; ($GENERATED - 1) / $DURATION" | bc)
 
 echo ""
-echo "Burst Speed: $TPS tok/s (N=$N)"
+echo "═══════════════════════════════════════════════════════════════"
+echo "OUTPUT ($GENERATED tokens):"
+echo "═══════════════════════════════════════════════════════════════"
+echo "$TOTAL_OUTPUT"
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "STATS:"
+echo "  Total tokens: $GENERATED"
+echo "  Duration: ${DURATION}s"
+echo "  Speed: $TPS tok/s"
+echo "═══════════════════════════════════════════════════════════════"

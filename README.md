@@ -54,18 +54,20 @@ Built on PyTorch. Use this to train models.
 **Note**: The system *automatically* detects if you are running on CUDA and switches to the Fused Triton Kernel for maximum speed.
 
 ### 2. Rust / Wasm Inference Engine (`inference/`)
-A bare-metal inference engine designed for the **DFINITY Internet Computer (IC)**. It runs entirely in WebAssembly within strict 20B instruction limits.
+A bare-metal inference engine designed for the **DFINITY Internet Computer (IC)**. It runs entirely in WebAssembly within ICP's 40B instruction limits.
+
 - **Weights**: Parses custom `.spinnet` sparse-ternary format.
-- **Execution**: Splits the Forward pass into chunks to fit in a single block.
-- **KV Cache**: Implemented incremental attention (O(1) complexity).
-- **Storage Optimization**: Hybrid **Bitmask Format** (v4) reduces model size by **14%** (0.32 MB vs 0.37 MB) compared to v2 while enabling sparse iteration (skipping zero weights).
-- **Single-User Speedup**: Implemented `generate_n_tokens` to generate ~50 tokens in a single update call, achieving **4.76 tok/sec** (9x speedup) for interactive sessions.
+- **Execution**: Splits the Forward pass into adaptive chunks based on real-time instruction monitoring.
+- **KV Cache**: Implemented incremental attention (O(1) complexity per token).
+- **Storage Optimization**: Hybrid **Bitmask Format** (v4) reduces model size by **14%** compared to v2 while enabling sparse iteration (skipping zero weights).
+- **Adaptive Chunking**: Automatically pauses layer processing at 60% instruction budget, resuming on next call. Works with any model size.
+- **Performance (3.2M param model)**: **1.73 tok/s** sustained over 100 tokens on ICP subnet.
 
 **Usage (IC Replica)**:
 ```bash
 cd inference
 dfx deploy
-./verify_single_user.sh
+./verify_single_user.sh "To be or not to be" 100
 ```
 
 ---
