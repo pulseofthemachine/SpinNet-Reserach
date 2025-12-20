@@ -16,7 +16,8 @@ class SpinNetConfig:
     n_head: int = 6
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = False 
+    bias: bool = False
+    octonion_attention: bool = False  # Enable octonion head mixing
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
@@ -45,18 +46,96 @@ def apply_rotary_emb(xq, xk, freqs_cis):
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
+class OctonionHeadMixer(nn.Module):
+    """
+    Mix attention heads using octonion (Cayley-Dickson) structure.
+    
+    After standard attention computes outputs for 8 heads, this module
+    mixes them using the same algebraic structure as OctonionTernaryLinear,
+    introducing non-commutativity at the head interaction level.
+    
+    Input: [B, 8, T, head_dim] (8 heads)
+    Output: [B, 8, T, head_dim] (mixed heads)
+    """
+    # Cayley-Dickson sign table (same as physics.py)
+    SIGNS = [
+        [+1, -1, -1, -1, -1, -1, -1, -1],  # y0
+        [+1, +1, +1, -1, +1, -1, -1, +1],  # y1
+        [+1, -1, +1, +1, +1, +1, -1, -1],  # y2
+        [+1, +1, -1, +1, +1, -1, +1, -1],  # y3
+        [+1, -1, -1, -1, +1, +1, +1, +1],  # y4
+        [+1, +1, -1, +1, -1, +1, -1, +1],  # y5
+        [+1, +1, +1, -1, -1, +1, +1, -1],  # y6
+        [+1, -1, +1, +1, -1, -1, +1, +1],  # y7
+    ]
+    
+    # Weight index table
+    WIDX = [
+        [0, 1, 2, 3, 4, 5, 6, 7],  # y0
+        [1, 0, 3, 2, 5, 4, 7, 6],  # y1
+        [2, 3, 0, 1, 6, 7, 4, 5],  # y2
+        [3, 2, 1, 0, 7, 6, 5, 4],  # y3
+        [4, 5, 6, 7, 0, 1, 2, 3],  # y4
+        [5, 4, 7, 6, 1, 0, 3, 2],  # y5
+        [6, 7, 4, 5, 2, 3, 0, 1],  # y6
+        [7, 6, 5, 4, 3, 2, 1, 0],  # y7
+    ]
+    
+    def __init__(self, head_dim):
+        super().__init__()
+        self.head_dim = head_dim
+        # Learnable mixing weights: 8 weight matrices [head_dim, head_dim]
+        self.W = nn.Parameter(torch.randn(8, head_dim, head_dim) * 0.02)
+        self.beta = nn.Parameter(torch.ones(head_dim) * 0.1)
+        
+        # Pre-register sign and widx tables as buffers
+        self.register_buffer('signs', torch.tensor(self.SIGNS, dtype=torch.float32))
+        self.register_buffer('widx', torch.tensor(self.WIDX, dtype=torch.long))
+    
+    def forward(self, x):
+        """
+        x: [B, 8, T, head_dim] - 8 attention head outputs
+        Returns: [B, 8, T, head_dim] - mixed via octonion algebra
+        """
+        B, H, T, D = x.shape
+        assert H == 8, f"OctonionHeadMixer requires exactly 8 heads, got {H}"
+        
+        # Split into 8 head tensors
+        heads = [x[:, i] for i in range(8)]  # List of [B, T, D]
+        
+        # Compute mixed outputs using Cayley-Dickson structure
+        # y_i = sum_j (sign[i,j] * heads[j] @ W[widx[i,j]].T)
+        outputs = []
+        for i in range(8):
+            acc = torch.zeros(B, T, D, device=x.device, dtype=x.dtype)
+            for j in range(8):
+                sign = self.signs[i, j]
+                w_idx = self.widx[i, j]
+                # heads[j]: [B, T, D], W[w_idx]: [D, D]
+                acc = acc + sign * (heads[j] @ self.W[w_idx])
+            outputs.append(acc * self.beta)
+        
+        # Stack back to [B, 8, T, D]
+        return torch.stack(outputs, dim=1)
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
+        self.octonion_attention = config.octonion_attention
         
         self.wq = OctonionTernaryLinear(config.n_embd, config.n_embd)
         self.wk = OctonionTernaryLinear(config.n_embd, config.n_embd)
         self.wv = OctonionTernaryLinear(config.n_embd, config.n_embd)
         self.wo = OctonionTernaryLinear(config.n_embd, config.n_embd)
         self.dropout = config.dropout
+        
+        # Octonion head mixer (only if enabled and n_head is multiple of 8)
+        if self.octonion_attention:
+            assert config.n_head % 8 == 0, f"octonion_attention requires n_head % 8 == 0, got {config.n_head}"
+            self.head_mixer = OctonionHeadMixer(self.head_dim)
 
     def forward(self, x, freqs_cis):
         B, T, C = x.size()
@@ -73,6 +152,18 @@ class CausalSelfAttention(nn.Module):
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=self.dropout if self.training else 0)
+        # y: [B, n_head, T, head_dim]
+        
+        # Octonion mixing across heads
+        if self.octonion_attention:
+            # Group heads into sets of 8 for octonion mixing
+            n_groups = self.n_head // 8
+            y_groups = y.view(B, n_groups, 8, T, self.head_dim)
+            y_mixed = []
+            for g in range(n_groups):
+                y_mixed.append(self.head_mixer(y_groups[:, g]))  # [B, 8, T, head_dim]
+            y = torch.cat(y_mixed, dim=1)  # [B, n_head, T, head_dim]
+        
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         
         y_parts = y.split(C // 8, dim=-1)
