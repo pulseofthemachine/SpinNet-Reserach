@@ -159,11 +159,23 @@ def compress_model(checkpoint_path: str, output_path: str, vocab_path: str = Non
         embed_count = 0
         norm_count = 0
         
+        # Check for tied embeddings (tok_embeddings and output share same tensor)
+        tok_emb = state_dict.get('tok_embeddings.weight')
+        output_w = state_dict.get('output.weight')
+        tied_embeddings = (tok_emb is not None and output_w is not None and 
+                          tok_emb.data_ptr() == output_w.data_ptr())
+        if tied_embeddings:
+            print("  [INFO] Detected tied embeddings - skipping output.weight")
+        
         for name, param in state_dict.items():
             param_data = param.detach()
             
             # Determine parameter type
             if 'tok_embeddings' in name or 'output.weight' in name:
+                # Skip output.weight if embeddings are tied (saved in tok_embeddings)
+                if name == 'output.weight' and tied_embeddings:
+                    print(f"  [SKIP] {name}: tied to tok_embeddings")
+                    continue
                 # Embedding layer - INT8 quantize
                 print(f"  [EMBED] {name}: {param_data.shape}")
                 quantized, scale = quantize_embedding(param_data)
