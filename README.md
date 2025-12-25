@@ -28,7 +28,12 @@ Built on PyTorch. Use this to train models.
 
 **Quick Start: Training**
 
-1.  **Prepare a Dataset**: Run the preparation script for your chosen data source.
+1.  **Install Dependencies**:
+    ```bash
+    pip install torch numpy triton tiktoken datasets transformers tqdm requests pandas ta
+    ```
+
+2.  **Prepare a Dataset**: Run the preparation script for your chosen data source.
     ```bash
     # Option A: TinyShakespeare (Fastest, good for testing)
     python data/tinyshakespeare/prepare.py
@@ -40,7 +45,7 @@ Built on PyTorch. Use this to train models.
     python data/fineweb/prepare.py
     ```
 
-2.  **Select a Config**: We provide configs for different scales.
+3.  **Select a Config**: We provide configs for different scales.
     ```bash
     # Train small Shakespeare model
     python train.py config/train_tinyshakespeare.py
@@ -52,7 +57,7 @@ Built on PyTorch. Use this to train models.
     python train.py config/scholar_124m.py
     ```
 
-3.  **Analyze Octonion Structure**: Visualize dimension specialization.
+4.  **Analyze Octonion Structure**: Visualize dimension specialization.
     ```bash
     python tools/analyze_octonion.py --ckpt experiments/out-tinystories-octonion/ckpt.pt
     ```
