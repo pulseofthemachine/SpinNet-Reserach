@@ -180,6 +180,10 @@ class HashEmbedding(nn.Module):
             chunk_emb += v * w
             
         return chunk_emb * math.sqrt(self.n_embd)
+    
+    def _get_all_embeddings(self) -> torch.Tensor:
+        """Get embeddings for all vocab tokens."""
+        return self._get_chunk_embeddings(0, self.vocab_size)
 
     def output_projection(self, hidden: torch.Tensor) -> torch.Tensor:
         """
