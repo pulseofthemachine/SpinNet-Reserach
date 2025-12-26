@@ -8,6 +8,7 @@ kernels when available, falling back to the reference implementation.
 """
 import torch
 import torch.nn as nn
+import math
 
 class TernaryComplexSTE(torch.autograd.Function):
     """Straight-Through Estimator for {-1, 0, 1}."""
@@ -40,7 +41,10 @@ class OctonionTernaryLinearRef(nn.Module):
         self.in_o = in_features // 8
         self.out_o = out_features // 8
         self.weight = nn.Parameter(torch.rand(8, self.out_o, self.in_o) * 2 - 1)
-        self.beta = nn.Parameter(torch.ones(self.out_o) * 0.1)
+        
+        # Variance-preserving beta: ternary E[w²] ≈ 2/3, so scale = sqrt(3/(2*in_o))
+        beta_init = math.sqrt(3.0 / (2.0 * self.in_o))
+        self.beta = nn.Parameter(torch.ones(self.out_o) * beta_init)
 
     def forward(self, x_parts):
         w_q = quantize_ternary(self.weight, self.training)

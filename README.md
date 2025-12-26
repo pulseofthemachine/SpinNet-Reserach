@@ -2,169 +2,164 @@
 
 **Status:** `EXPERIMENTAL` / `ACTIVE DEV`
 
-SpinNet is an exploratory architecture combining **1.58-bit (Ternary) Quantization** (à la BitNet) with **Hyper-Complex (Cayley-Dickson) Algebras**. Specifically, we replace standard linear layers with **Octonion (8D)** multiplications, aiming to compress more "intelligence" into lower memory bandwidth by enforcing structured geometric relationships in the latent space.
+SpinNet is an exploratory architecture combining **1.58-bit (Ternary) Quantization** (à la BitNet) with **Hyper-Complex Algebras**. We replace standard linear layers with **Octonion (8D)** or **Hadamard (32D)** multiplications, compressing the "brain" of the model by 8/32x while maintaining expressivity through structured geometric mixing.
 
-It is currently running on **CUDA** (via custom Triton kernels) and **WebAssembly** (on the Internet Computer blockchain).
+Currently running on **CUDA** (via custom Triton kernels) and **WebAssembly** (on the Internet Computer blockchain).
 
 ---
 
 ## 🧪 The Hypothesis
-Standard LLMs treat dimensions as independent. We suspect that forcing dimensions to interact via Cayley-Dickson algebras (Complex -> Quaternion -> Octonion) might allow:
-1.  **Higher Information Density**: 8 dimensions per "unit".
-2.  **Memory Compression**: Weights are ternary \({-1, 0, 1}\), drastically reducing I/O.
-3.  **Efficient Inference**: Structured math = fewer parameters for same effective dimensionality.
+
+Standard LLMs treat dimensions as independent. We force dimensions to interact via structured algebras:
+
+| Algebra | Dimension | Compression | Mixing | Complexity |
+|---------|-----------|-------------|--------|------------|
+| **Octonion** | 8D | 1/8th params | Cayley-Dickson | O(n²) |
+| **Hadamard** | 32D | 1/32th params | Fast Hadamard Transform | O(n log n) |
+
+This allows:
+1. **Extreme Compression**: 0.87M "brain" params for a 26M total model
+2. **Memory Efficiency**: Ternary weights {-1, 0, +1} = 1.58 bits
+3. **Fast Mixing**: FHT provides structured mixing with zero learned params
 
 ---
 
-## 🏗️ Architecture Components
+## 🏗️ Architecture Overview
 
-### 1. Python Training Stack (`src/`)
-Built on PyTorch. Use this to train models.
+### Algebra Selection
 
-- **Octonion Linear Layers**: Implements `y = x @ W^T` using the 8x8 Cayley-Dickson sign table.
-- **Octonion Head Mixer**: Mixes 8 attention heads using Cayley-Dickson algebra for improved representation learning (~8% loss reduction).
-- **Fused Triton Kernels**: ~6x speedup for linear layers, ~46x speedup for head mixer.
-  - Custom autograd functions that fuse the Octonion algebra into a single kernel launch.
+```python
+SpinNetConfig(
+    algebra="hadamard",  # or "octonion"
+    head_mixing=True,    # Enable algebra-based head mixing
+    n_head=32,           # Must be divisible by algebra dimension
+    n_embd=512,
+)
+```
 
-**Quick Start: Training**
+### Key Features
 
-1.  **Install Dependencies**:
-    ```bash
-    pip install torch numpy triton tiktoken datasets transformers tqdm requests pandas ta
-    ```
-
-2.  **Prepare a Dataset**: Run the preparation script for your chosen data source.
-    ```bash
-    # Option A: TinyShakespeare (Fastest, good for testing)
-    python data/tinyshakespeare/prepare.py
-    
-    # Option B: TinyStories (Children's stories, 50k vocab)
-    python data/tinystories/prepare.py
-    
-    # Option C: FineWeb (High quality, for larger models)
-    python data/fineweb/prepare.py
-    ```
-
-3.  **Select a Config**: We provide configs for different scales.
-    ```bash
-    # Train small Shakespeare model
-    python train.py config/train_tinyshakespeare.py
-    
-    # Train TinyStories with Octonion Head Mixer
-    python train.py config/train_tinystories_octonion.py
-    
-    # Train 124M parameter model (GPT-2 Small scale)
-    python train.py config/scholar_124m.py
-    ```
-
-4.  **Analyze Octonion Structure**: Visualize dimension specialization.
-    ```bash
-    python tools/analyze_octonion.py --ckpt experiments/out-tinystories-octonion/ckpt.pt
-    ```
-
-**Note**: The system *automatically* detects CUDA and switches to Fused Triton Kernels.
-
-### 2. Rust / Wasm Inference Engine (`inference/`)
-A bare-metal inference engine designed for the **DFINITY Internet Computer (IC)**. It runs entirely in WebAssembly within ICP's 40B instruction limits.
-
-- **Weights**: Parses custom `.spinnet` sparse-ternary format with Octonion Head Mixer support.
-- **Tokenizer**: Auto-detecting (char-level for vocab≤256, GPT-2 BPE otherwise).
-- **Head Mixer**: Full Cayley-Dickson algebra implementation for attention mixing.
-- **KV Cache**: Incremental attention (O(1) complexity per token) — also in Python!
-- **Temperature Sampling**: Softmax with T=0.8 for diverse generation.
-- **Adaptive Chunking**: Automatically pauses at 60% instruction budget.
+| Feature | Octonion (8D) | Hadamard (32D) |
+|---------|---------------|----------------|
+| Linear Compression | 8x | 32x |
+| Head Groups | Groups of 8 | Groups of 32 |
+| Mixing Method | Cayley-Dickson | FHT (O(n log n)) |
+| Triton Kernels | ✅ Fused | ✅ FP32 accumulators |
+| Inference Packing | ✅ 4x memory | ✅ 16x memory |
 
 ---
 
-## 🚀 ICP Canister Deployment
+## 🚀 Quick Start
 
-### Prerequisites
-- Install [dfx](https://internetcomputer.org/docs/current/developer-docs/setup/install/)
-- Have a trained model checkpoint
+### 1. Install Dependencies
+```bash
+pip install torch numpy triton tiktoken datasets transformers tqdm
+```
 
-### Deploy to Local Replica
+### 2. Prepare Dataset
+```bash
+# TinyStories (recommended for testing)
+python data/tinystories/prepare.py
+```
 
-1.  **Compress the model**:
-    ```bash
-    python compress.py experiments/out-tinystories-octonion/ckpt.pt --output inference/ckpt_v2.spinnet
-    ```
+### 3. Train
+```bash
+# Hadamard 32D (NEW - faster convergence, more compression)
+python train.py config/train_tinystories_hadamard.py
 
-2.  **Start the replica and deploy**:
-    ```bash
-    cd inference
-    dfx start --background
-    dfx deploy
-    ```
+# Octonion 8D (original)
+python train.py config/train_tinystories_octonion.py
+```
 
-3.  **Test with verify script**:
-    ```bash
-    ./verify_single_user.sh "Once upon a time" 50
-    ```
-    
-    Expected output (TinyStories):
-    ```
-    Once upon a time, there was a little girl named Lily. 
-    She liked to play outside and play with her friends...
-    ```
-
-### API Endpoints
-- `start_generation(prompt, max_tokens)` - Begin generation session
-- `start_forward()` - Initialize forward pass
-- `process_layers(n)` - Process n layers (adaptive chunking)
-- `finish_forward()` - Sample next token
-- `generate_n_tokens(n)` - Generate up to n tokens in one call
+### 4. Generate
+```bash
+python generate.py --ckpt experiments/out-tinystories-hadamard/ckpt.pt \
+    --prompt "Once upon a time" --max_tokens 100
+```
 
 ---
 
 ## 📊 Current Status
 
-### Verified Working
-- ✅ **Coherent Text Generation**: TinyStories produces children's story text
-- ✅ **Octonion Head Mixer**: Reduces loss by ~8% vs baseline
-- ✅ **KV Cache (Python)**: 4.6x speedup, 36+ tok/s generation
-- ✅ **Model Compression**: 13x smaller files, 3.7x less GPU memory
-- ✅ **ICP Deployment**: ~0.7 tok/s on local replica
+### ✅ Verified Working
+- **Hadamard 32D**: 0.87M brain params, loss 3.5 @ 200 iters, 25 tok/s
+- **Octonion 8D**: Full training + inference pipeline
+- **Head Mixing**: Both algebras support attention head mixing
+- **KV Cache**: 4.6x speedup for autoregressive generation
+- **ICP Deployment**: WebAssembly inference on Internet Computer
 
-### Recent Improvements
-- **KV Cache in Python**: Incremental decoding for fast inference
-- **Compression Pipeline**: Bitmask ternary format with 90% sparsity
-- **GPT-2 Tokenizer**: Both Rust and Python support 50k vocab models
-- **Head Mixer**: Full Cayley-Dickson implementation in Python + Rust
+### ⚠️ Rust/Wasm Status
+The Rust inference engine (`inference/`) currently supports **Octonion (8D) only**. Hadamard 32D support is not yet implemented.
 
----
-
-## 🗺️ Roadmap & Todos
-
-### Phase 1: Engine Optimization (✅ Complete)
-- [x] Implement Octonion logic in PyTorch
-- [x] Write Fused Triton Kernels (linear + head mixer)
-- [x] Port inference to Rust/Wasm with head mixer
-- [x] Implement KV Cache & incremental attention
-- [x] Implement GPT-2 tokenizer in Rust
-- [x] Add temperature sampling
-
-### Phase 2: Deployment & UX (🚧 In Progress)
-- [ ] **Client-Side Wasm**: Port to browser via `wasm-bindgen`
-- [ ] **Web Dashboard**: Visualizer for hyper-dimensional states
-- [ ] **Data Quality**: Train 100M+ param model on FineWeb-Edu
-- [.] **Mainnet**: Deploy canister to live IC network
+```
+inference/src/model.rs  - Octonion 8D ✅ | Hadamard 32D ❌
+```
 
 ---
 
 ## 📂 Key Files
 
 ### Python Training & Inference
-- `src/model/chassis.py`: Model architecture with KV Cache and Octonion Head Mixer
-- `src/model/cayley_dickson_cuda.py`: High-performance Triton kernels
-- `train.py`: Training script with gradient checkpointing
-- `generate.py`: Generate from `.pt` checkpoints
-- `generate_compressed.py`: Generate from `.spinnet` files
-- `compress.py`: Convert `.pt` → `.spinnet` format
+| File | Description |
+|------|-------------|
+| `src/model/chassis.py` | Model architecture with algebra selection |
+| `src/model/fht_cuda.py` | Hadamard 32D kernels with FHT |
+| `src/model/cayley_dickson_cuda.py` | Octonion 8D Triton kernels |
+| `config/train_tinystories_hadamard.py` | Hadamard training config |
+| `config/train_tinystories_octonion.py` | Octonion training config |
 
-### Rust/Wasm Inference
-- `inference/src/model.rs`: Rust inference with KV cache and head mixer
-- `inference/src/tokenizer.rs`: Auto-detecting GPT-2/char tokenizer
-- `inference/src/lib.rs`: IC Canister API
+### Rust/Wasm Inference (Octonion only)
+| File | Description |
+|------|-------------|
+| `inference/src/model.rs` | Rust inference with KV cache |
+| `inference/src/tokenizer.rs` | GPT-2/char tokenizer |
+| `inference/src/lib.rs` | IC Canister API |
 
-### Docs
-- `COMPRESSION_GUIDE.md`: Detailed compression workflow and API
+---
+
+## 🗺️ Roadmap
+
+### Phase 1: Core Engine ✅
+- [x] Octonion 8D linear layers + head mixer
+- [x] Fused Triton kernels (6x speedup)
+- [x] KV Cache for fast inference
+- [x] Rust/Wasm inference engine
+
+### Phase 2: Hadamard 32D ✅ NEW
+- [x] Fast Hadamard Transform (FHT) kernel
+- [x] 32D linear layers with O(n log n) mixing
+- [x] Variance-preserving beta initialization
+- [x] FP32 accumulators for numerical stability
+- [x] Ternary weight packing (16x memory reduction)
+
+### Phase 3: Deployment 🚧
+- [ ] Hadamard support in Rust/Wasm
+- [ ] Client-side browser inference
+- [ ] 100M+ param model on FineWeb-Edu
+- [ ] ICP mainnet deployment
+
+---
+
+## � Technical Details
+
+### Variance-Preserving Initialization
+All layers use `beta = sqrt(3 / (2 * fan_in))` for ternary weights, ensuring healthy gradient flow:
+```python
+# Ternary E[w²] ≈ 2/3, so scale = sqrt(1 / (fan_in * 2/3))
+beta_init = math.sqrt(3.0 / (2.0 * in_o))
+```
+
+### Parameter Breakdown (Hadamard 32D, TinyStories)
+```
+Total:      26.60M
+Embedding:  25.73M (97%)
+Brain:       0.87M (3%)  ← The actual "reasoning" part!
+```
+
+---
+
+## 📚 References
+
+- [BitNet: 1-bit LLMs](https://arxiv.org/abs/2310.11453)
+- [Fast Hadamard Transform](https://en.wikipedia.org/wiki/Hadamard_transform)
+- [Cayley-Dickson Construction](https://en.wikipedia.org/wiki/Cayley%E2%80%93Dickson_construction)

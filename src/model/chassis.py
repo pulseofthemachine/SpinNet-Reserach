@@ -17,6 +17,18 @@ if _USE_FUSED_HEAD_MIXER:
     except ImportError:
         _USE_FUSED_HEAD_MIXER = False
 
+# Hadamard 32D layers for extreme compression
+_HADAMARD_AVAILABLE = False
+_HADAMARD_HEAD_MIXER_AVAILABLE = False
+try:
+    from .fht_cuda import (HadamardLinear, HadamardTernaryLinear, 
+                           HadamardTernaryLinearTuple, HadamardHeadMixer, 
+                           HadamardHeadMixerFused)
+    _HADAMARD_AVAILABLE = True
+    _HADAMARD_HEAD_MIXER_AVAILABLE = True
+except ImportError:
+    pass
+
 @dataclass
 class SpinNetConfig:
     block_size: int = 256
@@ -26,7 +38,51 @@ class SpinNetConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = False
-    octonion_attention: bool = False  # Enable octonion head mixing
+    head_mixing: bool = False  # Enable algebra-based head mixing (auto-detects type)
+    algebra: str = "octonion"  # "octonion" (8D) or "hadamard" (32D)
+
+
+def get_linear_layer(config: SpinNetConfig):
+    """Get the appropriate linear layer class based on algebra config.
+    
+    Returns:
+        (LayerClass, algebra_dim): Layer class and dimension for splitting
+    """
+    if config.algebra == "hadamard":
+        if not _HADAMARD_AVAILABLE:
+            raise ImportError("Hadamard layers not available. Check fht_cuda.py import.")
+        return HadamardTernaryLinearTuple, 32
+    else:
+        return OctonionTernaryLinear, 8
+
+
+def get_head_mixer(config: SpinNetConfig, head_dim: int):
+    """Get the appropriate head mixer based on algebra config.
+    
+    Auto-detects whether to use Octonion (8-head) or Hadamard (32-head) mixing.
+    
+    Returns:
+        HeadMixer module or None if head_mixing is disabled
+    """
+    if not config.head_mixing:
+        return None
+    
+    if config.algebra == "hadamard":
+        # Hadamard: requires n_head divisible by 32
+        if config.n_head % 32 != 0:
+            raise ValueError(f"Hadamard head_mixing requires n_head % 32 == 0, got {config.n_head}")
+        if _HADAMARD_HEAD_MIXER_AVAILABLE:
+            return HadamardHeadMixerFused(head_dim)
+        else:
+            raise ImportError("Hadamard head mixer not available")
+    else:
+        # Octonion: requires n_head divisible by 8
+        if config.n_head % 8 != 0:
+            raise ValueError(f"Octonion head_mixing requires n_head % 8 == 0, got {config.n_head}")
+        if _USE_FUSED_HEAD_MIXER:
+            return OctonionHeadMixerFused(head_dim)
+        else:
+            return OctonionHeadMixer(head_dim)
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
@@ -145,7 +201,10 @@ class OctonionHeadMixer(nn.Module):
         self.head_dim = head_dim
         # Learnable mixing weights: 8 weight matrices [head_dim, head_dim]
         self.W = nn.Parameter(torch.randn(8, head_dim, head_dim) * 0.02)
-        self.beta = nn.Parameter(torch.ones(head_dim) * 0.1)
+        
+        # Variance-preserving beta for head mixing
+        beta_init = math.sqrt(3.0 / (2.0 * head_dim))
+        self.beta = nn.Parameter(torch.ones(head_dim) * beta_init)
         
         # Pre-register sign and widx tables as buffers
         self.register_buffer('signs', torch.tensor(SIGN_TABLE, dtype=torch.float32))
@@ -183,26 +242,26 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
-        self.octonion_attention = config.octonion_attention
+        self.head_mixing = config.head_mixing
         
-        self.wq = OctonionTernaryLinear(config.n_embd, config.n_embd)
-        self.wk = OctonionTernaryLinear(config.n_embd, config.n_embd)
-        self.wv = OctonionTernaryLinear(config.n_embd, config.n_embd)
-        self.wo = OctonionTernaryLinear(config.n_embd, config.n_embd)
+        # Get algebra-specific layer and dimension
+        LinearLayer, self.algebra_dim = get_linear_layer(config)
+        
+        # Mixer dimension for head grouping (8 for octonion, 32 for hadamard)
+        self.mixer_dim = 32 if config.algebra == "hadamard" else 8
+        
+        self.wq = LinearLayer(config.n_embd, config.n_embd)
+        self.wk = LinearLayer(config.n_embd, config.n_embd)
+        self.wv = LinearLayer(config.n_embd, config.n_embd)
+        self.wo = LinearLayer(config.n_embd, config.n_embd)
         self.dropout = config.dropout
         
-        # Octonion head mixer (only if enabled and n_head is multiple of 8)
-        if self.octonion_attention:
-            assert config.n_head % 8 == 0, f"octonion_attention requires n_head % 8 == 0, got {config.n_head}"
-            # Use fused CUDA kernel when available
-            if _USE_FUSED_HEAD_MIXER:
-                self.head_mixer = OctonionHeadMixerFused(self.head_dim)
-            else:
-                self.head_mixer = OctonionHeadMixer(self.head_dim)
+        # Head mixer (auto-detects octonion vs hadamard based on algebra config)
+        self.head_mixer = get_head_mixer(config, self.head_dim)
 
     def forward(self, x, freqs_cis, kv_cache: Optional[KVCache] = None, layer_idx: int = 0):
         B, T, C = x.size()
-        x_parts = x.split(C // 8, dim=-1)
+        x_parts = x.split(C // self.algebra_dim, dim=-1)
         q_parts = self.wq(x_parts)
         k_parts = self.wk(x_parts)
         v_parts = self.wv(x_parts)
@@ -245,39 +304,42 @@ class CausalSelfAttention(nn.Module):
         
         # y: [B, n_head, T, head_dim]
         
-        # Octonion mixing across heads
-        if self.octonion_attention:
-            # Group heads into sets of 8 for octonion mixing
-            n_groups = self.n_head // 8
-            y_groups = y.view(B, n_groups, 8, T, self.head_dim)
+        # Algebra-based head mixing (auto-detected: octonion=8 heads, hadamard=32 heads)
+        if self.head_mixer is not None:
+            # Group heads into sets for mixing
+            n_groups = self.n_head // self.mixer_dim
+            y_groups = y.view(B, n_groups, self.mixer_dim, T, self.head_dim)
             y_mixed = []
             for g in range(n_groups):
-                y_mixed.append(self.head_mixer(y_groups[:, g]))  # [B, 8, T, head_dim]
+                y_mixed.append(self.head_mixer(y_groups[:, g]))
             y = torch.cat(y_mixed, dim=1)  # [B, n_head, T, head_dim]
         
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         
-        y_parts = y.split(C // 8, dim=-1)
+        y_parts = y.split(C // self.algebra_dim, dim=-1)
         y_out_parts = self.wo(y_parts)
         return torch.cat(y_out_parts, dim=-1)
 
 class SwiGLUMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
+        # Get algebra-specific layer and dimension
+        LinearLayer, self.algebra_dim = get_linear_layer(config)
+        
         hidden_dim = 4 * config.n_embd
         hidden_dim = int(2 * hidden_dim / 3) 
-        hidden_dim = math.ceil(hidden_dim / 8) * 8
-        self.gate_proj = OctonionTernaryLinear(config.n_embd, hidden_dim)
-        self.up_proj = OctonionTernaryLinear(config.n_embd, hidden_dim)
-        self.down_proj = OctonionTernaryLinear(hidden_dim, config.n_embd)
+        hidden_dim = math.ceil(hidden_dim / self.algebra_dim) * self.algebra_dim
+        self.gate_proj = LinearLayer(config.n_embd, hidden_dim)
+        self.up_proj = LinearLayer(config.n_embd, hidden_dim)
+        self.down_proj = LinearLayer(hidden_dim, config.n_embd)
 
     def forward(self, x):
-        in_dim = x.shape[-1] // 8
+        in_dim = x.shape[-1] // self.algebra_dim
         x_parts = x.split(in_dim, dim=-1)
         gate_out = torch.cat(self.gate_proj(x_parts), dim=-1)
         up_out = torch.cat(self.up_proj(x_parts), dim=-1)
         h = F.silu(gate_out) * up_out
-        h_dim = h.shape[-1] // 8
+        h_dim = h.shape[-1] // self.algebra_dim
         h_parts = h.split(h_dim, dim=-1)
         out_parts = self.down_proj(h_parts)
         return torch.cat(out_parts, dim=-1)

@@ -36,7 +36,8 @@ n_head = 12
 n_embd = 768
 dropout = 0.0
 bias = False 
-octonion_attention = True  # Enable octonion head mixing
+head_mixing = True   # Enable algebra-based head mixing
+algebra = "octonion" # "octonion" (8D) or "hadamard" (32D)
 
 # AdamW
 learning_rate = 6e-4 
@@ -144,11 +145,12 @@ best_val_loss = 1e9
 if init_from == 'scratch':
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 (50304)")
-    # Get octonion_attention from config if set, default to False
-    octonion_attention = config.get('octonion_attention', False)
+    # Get algebra settings from config
+    head_mixing = config.get('head_mixing', False)
+    algebra = config.get('algebra', 'octonion')
     model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                       bias=bias, vocab_size=None, dropout=dropout, 
-                      octonion_attention=octonion_attention)
+                      head_mixing=head_mixing, algebra=algebra)
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = SpinNetConfig(**model_args)
     model = SpinNet(gptconf)
@@ -202,23 +204,36 @@ train_tokens = len(train_data) if train_data is not None else 0
 val_tokens = len(val_data) if val_data is not None else 0
 iters_per_epoch = train_tokens // tokens_per_iter if tokens_per_iter > 0 else 0
 
+# Algebra configuration
+algebra_type = config.get('algebra', 'octonion')
+algebra_dim = 32 if algebra_type == 'hadamard' else 8
+head_mixing_enabled = config.get('head_mixing', False)
+compression_ratio = algebra_dim
+mix_complexity = "O(n log n)" if algebra_type == 'hadamard' else "O(n²)"
+mix_ops = algebra_dim * 5 if algebra_type == 'hadamard' else algebra_dim * algebra_dim
+
 print(f"MODEL:")
 print(f"  Params       : {n_params/1e6:.2f}M total ({n_trainable/1e6:.2f}M trainable)")
-print(f"  Architecture : {n_layer} layers, {n_head} heads, {n_embd//8} dim × 8 octonion")
+print(f"  Architecture : {n_layer}L × {n_head}H × {n_embd}D")
 print(f"  Context      : {block_size} tokens")
-print(f"  Octonion Attn: {'Enabled' if config.get('octonion_attention', False) else 'Disabled'}")
+
+print(f"ALGEBRA:")
+print(f"  Type         : {algebra_type.upper()} ({algebra_dim}D)")
+print(f"  Compression  : 1/{compression_ratio}th params | {n_embd//algebra_dim} × {algebra_dim} sub-dim")
+print(f"  Mixing       : {mix_complexity} ({mix_ops} ops/interaction)")
+if head_mixing_enabled:
+    print(f"  Head Mixer   : {n_head//algebra_dim} groups × {algebra_dim} heads")
+else:
+    print(f"  Head Mixer   : Disabled")
 
 print(f"DATA:")
 print(f"  Dataset      : {dataset}")
-print(f"  Train Tokens : {train_tokens/1e6:.1f}M")
-print(f"  Val Tokens   : {val_tokens/1e6:.1f}M")
+print(f"  Train/Val    : {train_tokens/1e6:.1f}M / {val_tokens/1e6:.1f}M tokens")
 
 print(f"TRAINING:")
-print(f"  Batch Size   : {batch_size} x {gradient_accumulation_steps} = {effective_batch} effective")
+print(f"  Batch        : {batch_size} × {gradient_accumulation_steps} = {effective_batch} effective")
 print(f"  Tokens/Iter  : {tokens_per_iter:,}")
-print(f"  Iters/Epoch  : ~{iters_per_epoch:,}")
-print(f"  Max Iters    : {max_iters:,}")
-print(f"  Est. Epochs  : ~{max_iters / iters_per_epoch:.1f}" if iters_per_epoch > 0 else "  Est. Epochs  : N/A")
+print(f"  Iters        : {max_iters:,} (~{max_iters / iters_per_epoch:.1f} epochs)" if iters_per_epoch > 0 else f"  Iters        : {max_iters:,}")
 
 print(f"COMPUTE:")
 flops_per_token = 6 * n_params

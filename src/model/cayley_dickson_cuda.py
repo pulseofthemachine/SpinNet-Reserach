@@ -17,6 +17,7 @@ import torch.nn as nn
 import torch._dynamo
 import triton
 import triton.language as tl
+import math
 
 # -----------------------------------------------------------------------------
 # CAYLEY-DICKSON SIGN TABLE
@@ -632,7 +633,10 @@ class OctonionFusedLinear(nn.Module):
         
         # Weight: [8, out_o, in_o] - same as OctonionTernaryLinear
         self.weight = nn.Parameter(torch.rand(8, self.out_o, self.in_o) * 2 - 1)
-        self.beta = nn.Parameter(torch.ones(self.out_o) * 0.1)
+        
+        # Variance-preserving beta: ternary E[w²] ≈ 2/3, so scale = sqrt(3/(2*in_o))
+        beta_init = math.sqrt(3.0 / (2.0 * self.in_o))
+        self.beta = nn.Parameter(torch.ones(self.out_o) * beta_init)
         
         # Quantization function (imported lazily to avoid circular imports)
         self._quantize_fn = None
@@ -723,7 +727,10 @@ class OctonionPackedLinear(nn.Module):
             'weight_packed', 
             torch.zeros(8, self.out_o, self.in_o // 4, dtype=torch.uint8)
         )
-        self.beta = nn.Parameter(torch.ones(self.out_o) * 0.1)
+        
+        # Variance-preserving beta
+        beta_init = math.sqrt(3.0 / (2.0 * self.in_o))
+        self.beta = nn.Parameter(torch.ones(self.out_o) * beta_init)
         
         # Cache for unpacked weights (populated on first forward)
         self._weight_cache = None
@@ -1017,7 +1024,10 @@ class OctonionHeadMixerFused(nn.Module):
         self.head_dim = head_dim
         # Learnable mixing weights: 8 weight matrices [D, D]
         self.W = nn.Parameter(torch.randn(8, head_dim, head_dim) * 0.02)
-        self.beta = nn.Parameter(torch.ones(head_dim) * 0.1)
+        
+        # Variance-preserving beta for head mixing
+        beta_init = math.sqrt(3.0 / (2.0 * head_dim))
+        self.beta = nn.Parameter(torch.ones(head_dim) * beta_init)
         
         # Register tables as buffers
         self.register_buffer('signs', torch.tensor(SIGN_TABLE, dtype=torch.float32))

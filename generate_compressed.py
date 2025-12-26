@@ -258,6 +258,16 @@ def sample_from_spinnet(spinnet_path: str, prompt: str, max_tokens: int = 100,
     
     model.to(device).eval()
     
+    # Enable fused CUDA kernels for faster inference
+    if device == 'cuda':
+        try:
+            from src.model.cayley_dickson_cuda import optimize_for_inference
+            model = optimize_for_inference(model)
+            if verbose:
+                print("  Enabled fused CUDA kernels")
+        except ImportError:
+            pass
+    
     # Tokenize
     if config.get('vocab_size', 50257) <= 256:
         # Char-level tokenizer
