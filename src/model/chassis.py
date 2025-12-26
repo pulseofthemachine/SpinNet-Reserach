@@ -1,4 +1,5 @@
 import math
+import numpy as np
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 import torch
@@ -99,77 +100,86 @@ class RMSNorm(nn.Module):
 
 
 class HashEmbedding(nn.Module):
-    """
-    Composite Hash Embeddings for extreme parameter compression.
-    
-    Uses multiple small tables with prime bucket sizes. Token embeddings 
-    are the sum of lookups from all tables.
-    
-    For 50k vocab, 512 dim, 3 tables:
-    - Standard: 50,000 × 512 = 25.6M params
-    - Hash (bucket=1021, 3 tables): 1021 × 512 × 3 = 1.57M params (16x compression)
-    - Collision probability: 1/1021³ ≈ 1 in a billion
-    
-    Also provides output_projection() to compute logits using the same hash trick,
-    enabling weight tying without a full vocab×n_embd output matrix.
-    """
-    
     def __init__(self, vocab_size: int, n_embd: int, bucket_size: int = 1021, num_tables: int = 3):
         super().__init__()
-        # Use prime bucket size to minimize collision patterns
         self.bucket_size = bucket_size
         self.vocab_size = vocab_size
         self.n_embd = n_embd
         self.num_tables = num_tables
         
-        # Multiple small embedding tables
+        # 1. The Tables (Shared Pool)
         self.emb_tables = nn.ModuleList([
             nn.Embedding(bucket_size, n_embd) for _ in range(num_tables)
         ])
         
-        # Initialize with variance scaling (sum of N tables → scale by 1/sqrt(N))
+        # 2. Importance Weights (The "Noise Gate")
+        # Learned scalar for every token/table combo. 
+        # Cost: 50k * 3 params = 0.15M params (Tiny, but vital for quality)
+        self.importance = nn.Embedding(vocab_size, num_tables)
+        
+        # Init: Variance scaling for tables, 1.0 for importance
         for emb in self.emb_tables:
             nn.init.normal_(emb.weight, std=0.02 / math.sqrt(num_tables))
+        nn.init.normal_(self.importance.weight, mean=1.0, std=0.01) # Start close to sum()
         
-        # Precompute hash indices for all vocab tokens
-        # Use different prime multipliers for each table to spread collisions
-        primes = [1, 7919, 104729]  # Different primes for each table
-        vocab_indices = torch.arange(vocab_size)
-        for i in range(num_tables):
-            h = ((vocab_indices * primes[i % len(primes)]) // (bucket_size ** i)) % bucket_size
-            self.register_buffer(f'h{i}_all', h)
-    
+        # 3. Universal Hashing Constants (Fixed, Random)
+        # Replaces the 'base decomposition' logic with true scrambling
+        # We generate random coefficients a, b for each table
+        rng = np.random.RandomState(42)
+        self.register_buffer('hash_a', torch.from_numpy(rng.randint(1, 100000, size=(num_tables, 1))).long())
+        self.register_buffer('hash_b', torch.from_numpy(rng.randint(0, 100000, size=(num_tables, 1))).long())
+        self.register_buffer('prime', torch.tensor(1000000007)) # Large prime > vocab_size
+
+        # Precompute all indices for speed (memory vs compute tradeoff)
+        self._precompute_indices()
+
+    def _precompute_indices(self):
+        # Calculate ((ax + b) % p) % buckets for all vocab
+        # Shape: [vocab_size, num_tables]
+        all_ids = torch.arange(self.vocab_size, device=self.hash_a.device)
+        
+        # [num_tables, vocab_size]
+        indices = ((all_ids * self.hash_a + self.hash_b) % self.prime) % self.bucket_size
+        self.register_buffer('all_indices', indices.T) # [vocab_size, num_tables]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Hash with different schemes per table
-        primes = [1, 7919, 104729]
-        result = torch.zeros((*x.shape, self.n_embd), device=x.device, dtype=self.emb_tables[0].weight.dtype)
+        # x: [B, T]
         
-        for i, emb in enumerate(self.emb_tables):
-            h = ((x * primes[i % len(primes)]) // (self.bucket_size ** i)) % self.bucket_size
-            result = result + emb(h)
+        # 1. Get Indices: [B, T, num_tables]
+        indices = F.embedding(x, self.all_indices)
         
-        return result
-    def _get_all_embeddings(self) -> torch.Tensor:
-        """Get embeddings for all vocab tokens by summing across tables."""
-        primes = [1, 7919, 104729]
-        all_emb = torch.zeros(self.vocab_size, self.n_embd, 
-                              device=self.emb_tables[0].weight.device,
-                              dtype=self.emb_tables[0].weight.dtype)
-        for i, emb in enumerate(self.emb_tables):
-            h = getattr(self, f'h{i}_all')
-            all_emb = all_emb + emb(h)
-        return all_emb
-    
+        # 2. Get Vectors: [B, T, num_tables, n_embd]
+        vectors = []
+        for i in range(self.num_tables):
+            vectors.append(self.emb_tables[i](indices[:, :, i]))
+        vectors = torch.stack(vectors, dim=2)
+        
+        # 3. Get Importance Weights: [B, T, num_tables]
+        weights = self.importance(x)
+        
+        # 4. Weighted Sum: [B, T, n_embd]
+        x_emb = torch.sum(vectors * weights.unsqueeze(-1), dim=2)
+
+        # 5. Scale Signal
+        # Multiplies by ~32 (for 1024 dim), bringing variance from 0.02 -> 0.64
+        return x_emb * math.sqrt(self.n_embd)
+
     def _get_chunk_embeddings(self, start: int, end: int) -> torch.Tensor:
-        """Get embeddings for a chunk of vocab tokens."""
-        primes = [1, 7919, 104729]
-        chunk_emb = torch.zeros(end - start, self.n_embd,
-                                device=self.emb_tables[0].weight.device,
-                                dtype=self.emb_tables[0].weight.dtype)
-        for i, emb in enumerate(self.emb_tables):
-            h = getattr(self, f'h{i}_all')[start:end]
-            chunk_emb = chunk_emb + emb(h)
-        return chunk_emb
+        """
+        Reconstructs the full embedding matrix for a chunk of the vocab.
+        Used for Output Projection / Chunked Loss.
+        """
+        indices = self.all_indices[start:end]
+        weights = self.importance.weight[start:end]
+        
+        chunk_emb = torch.zeros(end - start, self.n_embd, device=indices.device, dtype=weights.dtype)
+        
+        for i in range(self.num_tables):
+            v = self.emb_tables[i](indices[:, i])
+            w = weights[:, i].unsqueeze(-1)
+            chunk_emb += v * w
+            
+        return chunk_emb * math.sqrt(self.n_embd)
 
     def output_projection(self, hidden: torch.Tensor) -> torch.Tensor:
         """
