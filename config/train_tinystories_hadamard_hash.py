@@ -38,11 +38,18 @@ beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0
 
-# Schedule
+# Schedule (Two-Stage BitNet-style)
 decay_lr = True
-warmup_iters = 500
+warmup_iters = 0
 lr_decay_iters = 25000
 min_lr = 3e-4
+
+# Two-stage schedule (BitNet b1.58)
+two_stage_schedule = True       # Enable two-stage LR and WD
+cooldown_start = 0.5            # Stage 2 starts at 50% of max_iters (iter 12500)
+cooldown_lr = 3e-4              # Stage 2 peak LR (10x lower than stage 1)
+stage1_wd_peak = 0.1            # Weight decay peaks at 0.1 during stage 1
+stage2_wd = 0.0                 # Weight decay disabled during stage 2
 
 # System
 device = 'cuda'

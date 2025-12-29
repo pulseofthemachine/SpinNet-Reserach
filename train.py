@@ -48,11 +48,17 @@ beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 
 
-# Schedule
+# Schedule (Two-Stage BitNet-style)
 decay_lr = True
 warmup_iters = 2000 
 lr_decay_iters = 600000 
-min_lr = 6e-5 
+min_lr = 6e-5
+# Two-stage schedule (BitNet b1.58)
+two_stage_schedule = True       # Enable two-stage LR and WD
+cooldown_start = 0.5            # Stage 2 starts at 50% of max_iters
+cooldown_lr = 1e-4              # Stage 2 peak LR (lower than stage 1)
+stage1_wd_peak = 0.1            # Weight decay peak during stage 1 (cosine schedule)
+stage2_wd = 0.0                 # Weight decay during stage 2 (disabled)
 
 # System
 backend = 'nccl' 
@@ -287,23 +293,71 @@ def estimate_loss():
     return out
 
 def get_lr(it):
+    """Two-stage learning rate schedule (BitNet b1.58 style)."""
+    # Check if two-stage is enabled
+    use_two_stage = config.get('two_stage_schedule', False)
+    cooldown_iter = int(config.get('cooldown_start', 0.5) * max_iters)
+    stage2_lr = config.get('cooldown_lr', min_lr * 10)
+    
     if it < warmup_iters:
+        # Warmup phase
         return learning_rate * (it + 1) / (warmup_iters + 1)
-    if it > lr_decay_iters:
-        return min_lr
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return min_lr + coeff * (learning_rate - min_lr)
+    
+    if use_two_stage and it >= cooldown_iter:
+        # STAGE 2: Cooldown phase - lower peak LR with cosine decay
+        stage2_iters = max_iters - cooldown_iter
+        stage2_progress = (it - cooldown_iter) / stage2_iters
+        coeff = 0.5 * (1.0 + math.cos(math.pi * stage2_progress))
+        return min_lr + coeff * (stage2_lr - min_lr)
+    else:
+        # STAGE 1: Standard cosine decay with high peak LR
+        if it > lr_decay_iters:
+            return min_lr
+        decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        return min_lr + coeff * (learning_rate - min_lr)
+
+def get_wd(it):
+    """Two-stage weight decay schedule (BitNet b1.58 style).
+    Stage 1: Cosine schedule peaking at stage1_wd_peak (default 0.1)
+    Stage 2: Disabled (0.0)
+    """
+    use_two_stage = config.get('two_stage_schedule', False)
+    if not use_two_stage:
+        return weight_decay  # Return constant if not using two-stage
+    
+    cooldown_iter = int(config.get('cooldown_start', 0.5) * max_iters)
+    wd_peak = config.get('stage1_wd_peak', 0.1)
+    stage2_wd_val = config.get('stage2_wd', 0.0)
+    
+    if it >= cooldown_iter:
+        # STAGE 2: Weight decay disabled
+        return stage2_wd_val
+    else:
+        # STAGE 1: Cosine schedule from 0 → peak → 0 (within stage 1)
+        # Progress through stage 1 (0 to 1)
+        stage1_progress = it / cooldown_iter
+        # Cosine that goes 0 → 1 → 0 over the stage
+        coeff = math.sin(math.pi * stage1_progress)
+        return wd_peak * coeff
 
 X, Y = get_batch('train') 
 t0 = time.time()
 local_iter_num = 0 
 
 while True:
-    # 1. Update LR
+    # 1. Update LR and WD (Two-Stage Schedule)
     lr = get_lr(iter_num) if decay_lr else learning_rate
+    wd = get_wd(iter_num)  # Dynamic weight decay
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+        # Only apply WD to decay params group (first group)
+        if param_group.get('weight_decay', -1) != 0.0 or config.get('two_stage_schedule', False):
+            if 'initial_wd' not in param_group:
+                param_group['initial_wd'] = param_group.get('weight_decay', weight_decay)
+            # Only update WD for params that should decay (check initial config)
+            if param_group.get('initial_wd', 0) > 0:
+                param_group['weight_decay'] = wd
 
     # 2. Evaluation & Checkpointing
     if iter_num % eval_interval == 0 and iter_num > 0:
@@ -362,9 +416,9 @@ while True:
         w_stats = mid_layer.attention.wq.weight.detach()
         w_std = w_stats.std().item()
         
-        # Format: Iter | Loss | Time | GradNorm | WeightStd | LR
+        # Format: Iter | Loss | Time | GradNorm | WeightStd | LR | WD
         print(f"iter {iter_num:>5} | loss {lossf:.4f} | time {dt*1000:.0f}ms | "
-              f"grad_n {grad_norm:.4f} | w_std {w_std:.4f} | lr {lr:.2e}")
+              f"grad_n {grad_norm:.4f} | w_std {w_std:.4f} | lr {lr:.2e} | wd {wd:.3f}")
 
     iter_num += 1
     local_iter_num += 1

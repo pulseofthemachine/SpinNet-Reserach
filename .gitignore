@@ -15,8 +15,10 @@ out/
 # Datasets (Keep scripts, ignore binaries)
 data/**/*.bin
 !data/tinyshakespeare/prepare.py
-!data/crypto/prepare.py
 !data/fineweb/prepare.py
+data/mnist/MNIST
+generated/
+data/cifar10/cifar-10-batches-py/
 
 # Rust / DFINITY
 target/
@@ -31,4 +33,3 @@ inference/Cargo.lock
 # Logs
 *.log
 runs/
-data/mnist/MNIST

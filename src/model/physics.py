@@ -10,26 +10,43 @@ import torch
 import torch.nn as nn
 import math
 
-class TernaryComplexSTE(torch.autograd.Function):
-    """Straight-Through Estimator for {-1, 0, 1}."""
+class TernaryAbsmeanSTE(torch.autograd.Function):
+    """
+    BitNet b1.58 style Straight-Through Estimator for ternary {-1, 0, 1}.
+    
+    Uses absmean scaling: γ = mean(|W|), then round(W/γ) clamped to [-1,+1].
+    This adaptive threshold ensures consistent ternary distribution across training.
+    """
     @staticmethod
     def forward(ctx, w_latent, training=True):
-        w_quant = torch.round(w_latent)
+        # Compute per-tensor absolute mean as scale factor
+        # Add small epsilon to avoid division by zero
+        gamma = w_latent.abs().mean() + 1e-8
+        
+        # Scale weights by absmean, round, and clamp to ternary
+        w_scaled = w_latent / gamma
+        w_quant = torch.round(w_scaled)
         w_quant = torch.clamp(w_quant, -1, 1)
-        ctx.save_for_backward(w_latent)
+        
+        ctx.save_for_backward(w_latent, torch.tensor([gamma]))
         return w_quant
 
     @staticmethod
     def backward(ctx, grad_output):
+        w_latent, gamma_tensor = ctx.saved_tensors
         grad_input = grad_output.clone()
-        # The Scream Clamp
-        grad_input = torch.clamp(grad_input, -2.0, 2.0) 
+        # The Scream Clamp - prevent gradient explosion
+        grad_input = torch.clamp(grad_input, -2.0, 2.0)
         return grad_input, None
 
 def quantize_ternary(w, training=True):
-    w_quant = TernaryComplexSTE.apply(w, training)
+    """
+    BitNet b1.58 style ternary quantization with absmean scaling.
+    
+    Formula: W_ternary = clip(round(W / γ), -1, +1) where γ = mean(|W|)
+    """
+    w_quant = TernaryAbsmeanSTE.apply(w, training)
     # Soft clamp on latent weights to bound gradient magnitudes
-    # This ensures gradients respect the scream clamp boundary
     w_clamped = w.clamp(-1.5, 1.5)
     return w_clamped + (w_quant - w_clamped).detach()
 
