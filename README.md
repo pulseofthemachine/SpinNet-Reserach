@@ -50,6 +50,55 @@ WalshConfig(
 
 ---
 
+## 🔄 mHC: Manifold Hyper-Connections (NEW)
+
+> Based on [arxiv.org/abs/2512.24880](https://arxiv.org/abs/2512.24880)
+
+mHC replaces standard residual connections with **multi-stream residuals** using doubly-stochastic mixing matrices for guaranteed stability.
+
+### Why mHC?
+
+Standard residual: `x = x + layer(x)` — single stream, can collapse
+
+mHC residual: `x = H_res @ x + H_post^T @ layer(H_pre @ x)` — n parallel streams with balanced mixing
+
+### Key Properties
+
+| Property | Benefit |
+|----------|---------|
+| **Doubly stochastic H_res** | No stream can dominate (prevents collapse) |
+| **Spectral norm ≤ 1** | No gradient explosion |
+| **Birkhoff polytope** | Mixing = convex combo of permutations |
+| **Sinkhorn-Knopp projection** | Efficient manifold constraint |
+
+### Usage
+
+```python
+WalshConfig(
+    use_mhc=True,    # Enable mHC residual streams
+    n_streams=4,     # Number of parallel streams
+    # ... other config
+)
+```
+
+### Channel Specialization Loss
+
+Encourages Hadamard channels to develop **distinct semantic roles** rather than uniform activation:
+
+```python
+# Options: 'specialization', 'contextual', 'bottleneck', or None
+channel_loss = 'specialization'
+channel_loss_weight = 0.01
+```
+
+| Loss | Effect |
+|------|--------|
+| `specialization` | Channels compete for distinct response patterns |
+| `contextual` | Nearby tokens use different channels |
+| `bottleneck` | Sparse, selective channel activation |
+
+---
+
 ## 🧬 Hash Embeddings (Experimental)
 
 > [!WARNING]
@@ -178,11 +227,11 @@ inference/src/model.rs  - Octonion 8D ✅ | Hadamard 32D ❌ | Hash Embeddings �
 | File | Description |
 |------|-------------|
 | `src/model/chassis.py` | Model architecture with algebra selection + hash embeddings |
+| `src/model/mhc.py` | Manifold Hyper-Connections (multi-stream residuals) |
 | `src/model/fht_cuda.py` | Hadamard 32D kernels with FHT |
 | `src/model/cayley_dickson_cuda.py` | Octonion 8D Triton kernels |
-| `config/train_tinystories_hadamard.py` | Hadamard training config |
-| `config/train_tinystories_hadamard_hash.py` | Hadamard + Hash embeddings config |
-| `config/train_tinystories_octonion.py` | Octonion training config |
+| `analyze_type_clusters.py` | Channel specialization analysis (18 semantic categories) |
+| `config/train_wikipedia_mhc.py` | Wikipedia + mHC + channel specialization |
 
 ### Rust/Wasm Inference (Octonion only)
 | File | Description |
@@ -213,7 +262,15 @@ inference/src/model.rs  - Octonion 8D ✅ | Hadamard 32D ❌ | Hash Embeddings �
 - [ ] 3-table hash embeddings (better collision handling)
 - [ ] RAG integration for fact retrieval
 
-### Phase 4: Deployment 🚧
+### Phase 4: mHC + Channel Specialization 🧪
+- [x] Manifold Hyper-Connections (multi-stream residuals)
+- [x] Sinkhorn-Knopp doubly-stochastic projection
+- [x] Channel-balanced initialization
+- [x] Three channel specialization losses
+- [x] Semantic analysis framework (18 categories)
+- [ ] Full mHC training validation
+
+### Phase 5: Deployment 🚧
 - [ ] Hadamard support in Rust/Wasm
 - [ ] Hash embeddings in Rust/Wasm
 - [ ] Client-side browser inference
@@ -232,6 +289,14 @@ self.alpha = nn.Parameter(torch.ones(ALGEBRA_DIM, in_o))
 # β: per-feature output scaling with variance-preserving init
 beta_init = math.sqrt(3.0 / (2.0 * in_o))
 self.beta = nn.Parameter(torch.ones(ALGEBRA_DIM, out_o) * beta_init)
+```
+
+### Channel-Balanced Initialization
+Prevents channel collapse by ensuring equal Frobenius norm across all 32 Hadamard channels:
+```python
+weight_init = torch.randn(32, out_o, in_o) * 0.02
+channel_norms = weight_init.view(32, -1).norm(dim=1, keepdim=True)
+weight_init = weight_init / channel_norms  # Equal magnitude per channel
 ```
 
 ### Parameter Breakdown
@@ -255,6 +320,8 @@ Brain:       0.95M (48%)
 ## 📚 References
 
 - [BitNet: 1-bit LLMs](https://arxiv.org/abs/2310.11453)
+- [mHC: Manifold Hyper-Connections](https://arxiv.org/abs/2512.24880) ← NEW
 - [Fast Hadamard Transform](https://en.wikipedia.org/wiki/Hadamard_transform)
 - [Cayley-Dickson Construction](https://en.wikipedia.org/wiki/Cayley%E2%80%93Dickson_construction)
 - [Hash Embeddings (Svenstrup et al.)](https://arxiv.org/abs/1709.03933)
+- [Sinkhorn-Knopp Algorithm](https://en.wikipedia.org/wiki/Sinkhorn%27s_theorem) ← NEW

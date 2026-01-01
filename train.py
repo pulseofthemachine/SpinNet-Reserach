@@ -10,6 +10,7 @@ import pickle
 from contextlib import nullcontext
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch._dynamo import disable
 from src.model import WalshConfig, Walsh
 
@@ -39,6 +40,15 @@ bias = False
 head_mixing = True   # Enable algebra-based head mixing
 algebra = "octonion" # "octonion" (8D) or "hadamard" (32D)
 hash_embeddings = False  # Use composite hash embeddings (25x compression)
+
+# mHC (Manifold Hyper-Connections) - multi-stream residuals
+use_mhc = False  # Enable mHC residual streams
+n_streams = 4    # Number of parallel streams
+
+# Channel specialization losses (for emergent type structure)
+# Options: 'specialization', 'contextual', 'bottleneck', or None
+channel_loss = None  # Which loss to use
+channel_loss_weight = 0.01  # Weight for the loss
 
 # AdamW
 learning_rate = 6e-4 
@@ -156,12 +166,22 @@ if init_from == 'scratch':
     head_mixing = config.get('head_mixing', False)
     algebra = config.get('algebra', 'octonion')
     hash_embeddings = config.get('hash_embeddings', False)
+    use_mhc = config.get('use_mhc', False)
+    n_streams = config.get('n_streams', 4)
+    
     model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                       bias=bias, vocab_size=None, dropout=dropout, 
                       head_mixing=head_mixing, algebra=algebra, hash_embeddings=hash_embeddings)
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = WalshConfig(**model_args)
-    model = Walsh(gptconf)
+    
+    # Choose model class based on mHC setting
+    if use_mhc:
+        from src.model import mHCWalsh
+        model = mHCWalsh(gptconf, n_streams=n_streams)
+        print(f"Using mHCWalsh with {n_streams} streams")
+    else:
+        model = Walsh(gptconf)
     
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
@@ -177,7 +197,18 @@ elif init_from == 'resume':
         checkpoint_model_args['bias'] = False
         
     gptconf = WalshConfig(**checkpoint_model_args)
-    model = Walsh(gptconf)
+    
+    # Check if checkpoint was mHC model
+    use_mhc = config.get('use_mhc', False)
+    n_streams = config.get('n_streams', 4)
+    
+    if use_mhc:
+        from src.model import mHCWalsh
+        model = mHCWalsh(gptconf, n_streams=n_streams)
+        print(f"Resuming mHCWalsh with {n_streams} streams")
+    else:
+        model = Walsh(gptconf)
+    
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
     for k,v in list(state_dict.items()):
@@ -272,6 +303,133 @@ checkpoint = None
 if compile:
     print("Compiling Walsh (Default Mode)...")
     model = torch.compile(model, mode="default")
+
+# -----------------------------------------------------------------------------
+# CHANNEL SPECIALIZATION LOSSES (Emergent Semantic Structure)
+# -----------------------------------------------------------------------------
+def compute_channel_specialization_loss(hidden_states, hadamard_dim=32):
+    """
+    Encourage channels to specialize for different semantic roles WITHOUT
+    forcing uniform usage. Channels compete to represent different patterns.
+    
+    Core idea: 
+    - Channels that activate for similar tokens should be different
+    - Channels should have distinct "activation signatures"
+    - But we don't care if channel 4 is used more than channel 17
+    """
+    B, T, D = hidden_states.shape
+    n_blocks = D // hadamard_dim
+    
+    # Reshape: [B*T, n_blocks, hadamard_dim]
+    h = hidden_states.view(B * T, n_blocks, hadamard_dim)
+    
+    # Strategy: Channel signatures should be distinguishable
+    # Compute "what patterns does each channel respond to"
+    # [n_blocks, hadamard_dim, B*T] - channels × tokens
+    channel_responses = h.permute(1, 2, 0)
+    
+    # For each block, compute channel-channel similarity
+    # High similarity = channels doing the same thing = bad
+    channel_sims = []
+    for block_idx in range(n_blocks):
+        responses = channel_responses[block_idx]  # [hadamard_dim, B*T]
+        # Normalize each channel's response pattern
+        normed = F.normalize(responses, dim=-1)
+        # Compute pairwise similarity
+        sim = normed @ normed.T  # [hadamard_dim, hadamard_dim]
+        # Extract off-diagonal (we want these LOW)
+        mask = ~torch.eye(hadamard_dim, device=sim.device, dtype=torch.bool)
+        off_diag = sim[mask]
+        channel_sims.append(off_diag.abs().mean())
+    
+    # Average across blocks
+    specialization_loss = torch.stack(channel_sims).mean()
+    
+    return specialization_loss
+
+
+def compute_contextual_channel_diversity_loss(hidden_states, hadamard_dim=32):
+    """
+    Encourage different channels to activate for different contexts.
+    
+    Key insight: If the same token appears in different contexts, different
+    channels should be used. This naturally creates semantic grouping.
+    """
+    B, T, D = hidden_states.shape
+    n_blocks = D // hadamard_dim
+    
+    # Reshape: [B, T, n_blocks, hadamard_dim]
+    h = hidden_states.view(B, T, n_blocks, hadamard_dim)
+    
+    # Sample pairs of tokens from the sequence
+    # We want: nearby tokens (similar context) → different channel usage
+    if T < 8:
+        return torch.tensor(0.0, device=hidden_states.device)
+    
+    # Sample stride-k pairs (nearby in sequence)
+    stride = 4
+    n_pairs = min(32, T - stride)
+    
+    pair_losses = []
+    for _ in range(n_pairs):
+        idx = torch.randint(0, T - stride, (1,), device=hidden_states.device).item()
+        
+        # Get two nearby tokens
+        t1 = h[:, idx]      # [B, n_blocks, hadamard_dim]
+        t2 = h[:, idx + stride]  # [B, n_blocks, hadamard_dim]
+        
+        # Which channels are active for each?
+        t1_active = (t1.abs() > t1.abs().mean(dim=-1, keepdim=True)).float()
+        t2_active = (t2.abs() > t2.abs().mean(dim=-1, keepdim=True)).float()
+        
+        # Penalize overlap (want different channels for different positions)
+        overlap = (t1_active * t2_active).mean()
+        pair_losses.append(overlap)
+    
+    # We want LOW overlap (different positions use different channels)
+    diversity_loss = torch.stack(pair_losses).mean()
+    
+    return diversity_loss
+
+
+def compute_information_bottleneck_loss(hidden_states, hadamard_dim=32):
+    """
+    Information bottleneck for channel selection.
+    
+    Channels should be:
+    1. Selective (low entropy within each channel - sparse activation)
+    2. Diverse (different time steps use different channels)
+    
+    This naturally creates type-like structure without forcing it.
+    """
+    B, T, D = hidden_states.shape
+    n_blocks = D // hadamard_dim
+    
+    # Reshape: [B, T, n_blocks, hadamard_dim]
+    h = hidden_states.view(B, T, n_blocks, hadamard_dim)
+    
+    # Average over blocks for simplicity: [B, T, hadamard_dim]
+    h_avg = h.mean(dim=2)
+    
+    # 1. Selectivity: Each channel should be sparse (high peakedness)
+    # Use negative entropy: peaked distributions have low entropy
+    channel_probs = F.softmax(h_avg.abs(), dim=-1)  # [B, T, hadamard_dim]
+    entropy = -(channel_probs * (channel_probs + 1e-8).log()).sum(dim=-1).mean()
+    
+    # We want LOW entropy (peaked/selective activation)
+    selectivity_loss = entropy / math.log(hadamard_dim)  # Normalize
+    
+    # 2. Diversity: Different time steps should use different channels
+    # Compute temporal variance per channel
+    channel_variance = h_avg.var(dim=1).mean()  # Higher = more diverse usage
+    
+    # We want HIGH variance (channels used differently over time)
+    diversity_loss = -channel_variance
+    
+    # Combine
+    return selectivity_loss + 0.1 * diversity_loss
+
+
 
 # -----------------------------------------------------------------------------
 # UTILS & LOOPS (Enhanced Telemetry)
@@ -381,9 +539,31 @@ while True:
                 torch.cuda.empty_cache()
     
     # 3. Forward / Backward Pass
+    channel_loss_type = config.get('channel_loss', None)
+    channel_loss_weight = config.get('channel_loss_weight', 0.01)
+    hadamard_dim = 32 if config.get('algebra', 'octonion') == 'hadamard' else 8
+    
     for micro_step in range(gradient_accumulation_steps):
         with ctx:
-            logits, loss = model(X, Y)
+            # Determine if we need hidden states for channel regularization
+            need_hidden = channel_loss_type is not None
+            
+            if need_hidden:
+                logits, loss, hidden = model(X, Y, return_hidden=True)
+                
+                # Apply selected channel loss
+                if channel_loss_type == 'specialization':
+                    ch_loss = compute_channel_specialization_loss(hidden, hadamard_dim)
+                    loss = loss + channel_loss_weight * ch_loss
+                elif channel_loss_type == 'contextual':
+                    ch_loss = compute_contextual_channel_diversity_loss(hidden, hadamard_dim)
+                    loss = loss + channel_loss_weight * ch_loss
+                elif channel_loss_type == 'bottleneck':
+                    ch_loss = compute_information_bottleneck_loss(hidden, hadamard_dim)
+                    loss = loss + channel_loss_weight * ch_loss
+            else:
+                logits, loss = model(X, Y)
+                
             loss = loss / gradient_accumulation_steps 
         X, Y = get_batch('train') 
         loss.backward()

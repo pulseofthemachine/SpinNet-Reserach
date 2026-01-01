@@ -367,8 +367,11 @@ class HadamardTernaryLinear(nn.Module):
         self.in_o = in_features // self.ALGEBRA_DIM   # 32 input groups
         self.out_o = out_features // self.ALGEBRA_DIM  # 32 output groups
         
-        # 32 ternary weight matrices [32, out_o, in_o]
-        self.weight = nn.Parameter(torch.rand(self.ALGEBRA_DIM, self.out_o, self.in_o) * 2 - 1)
+        # 32 ternary weight matrices [32, out_o, in_o] - equal magnitude across channels
+        weight_init = torch.randn(self.ALGEBRA_DIM, self.out_o, self.in_o) * 0.02
+        channel_norms = weight_init.view(self.ALGEBRA_DIM, -1).norm(dim=1, keepdim=True).unsqueeze(-1)
+        weight_init = weight_init / (channel_norms + 1e-8) * 0.02 * math.sqrt(self.out_o * self.in_o)
+        self.weight = nn.Parameter(weight_init)
         
         # Alpha (input diagonal): per-feature scaling BEFORE FHT [32, in_o]
         self.alpha = nn.Parameter(torch.ones(self.ALGEBRA_DIM, self.in_o))
@@ -454,15 +457,21 @@ class HadamardLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         
-        # Ternary weight matrix
-        self.weight = nn.Parameter(torch.rand(self.ALGEBRA_DIM, self.out_o, self.in_o) * 2 - 1)
+        # Ternary weight matrix - initialized with equal magnitude across channels
+        # This prevents any channel from getting a head start during training
+        weight_init = torch.randn(self.ALGEBRA_DIM, self.out_o, self.in_o) * 0.02
+        # Normalize each channel to have equal Frobenius norm
+        channel_norms = weight_init.view(self.ALGEBRA_DIM, -1).norm(dim=1, keepdim=True).unsqueeze(-1)
+        weight_init = weight_init / (channel_norms + 1e-8) * 0.02 * math.sqrt(self.out_o * self.in_o)
+        self.weight = nn.Parameter(weight_init)
         
         # Alpha (input diagonal): per-feature scaling BEFORE FHT
-        # Shape [32, in_o] for full resolution within each Hadamard group
+        # Shape [32, in_o] - equal across channels to start
         self.alpha = nn.Parameter(torch.ones(self.ALGEBRA_DIM, self.in_o))
         
         # Beta (output diagonal): per-feature scaling AFTER FHT
         # Shape [32, out_o] for full resolution, with variance-preserving init
+        # Equal across channels to prevent channel bias
         beta_init = math.sqrt(3.0 / (2.0 * self.in_o))
         self.beta = nn.Parameter(torch.ones(self.ALGEBRA_DIM, self.out_o) * beta_init)
         
