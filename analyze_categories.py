@@ -156,6 +156,92 @@ SEMANTIC_CATEGORIES = {
     ],
 }
 
+# Sentence categories for discourse-level analysis
+SENTENCE_CATEGORIES = {
+    "Questions": [
+        "What is the capital of France?",
+        "How does photosynthesis work?",
+        "Why did the Roman Empire fall?",
+        "When was the Declaration signed?",
+        "Who invented the telephone?",
+        "Where do elephants live?",
+    ],
+    
+    "Statements": [
+        "The Earth orbits the Sun.",
+        "Water freezes at zero degrees.",
+        "Paris is the capital of France.",
+        "The brain controls the body.",
+        "Plants need sunlight to grow.",
+        "Humans have two lungs.",
+    ],
+    
+    "Commands": [
+        "Calculate the derivative.",
+        "Consider the following example.",
+        "Note that this is important.",
+        "Remember the key points.",
+        "Compare the two methods.",
+        "Analyze the results carefully.",
+    ],
+    
+    "Narrative": [
+        "The king rode through the forest.",
+        "She opened the ancient door slowly.",
+        "They discovered a hidden treasure.",
+        "The storm raged through the night.",
+        "He remembered his childhood home.",
+        "The journey began at dawn.",
+    ],
+    
+    "Technical": [
+        "The algorithm has O(n log n) complexity.",
+        "This function returns a boolean value.",
+        "The database stores user information.",
+        "The protocol encrypts all data.",
+        "The server processes requests asynchronously.",
+        "The API endpoint accepts JSON.",
+    ],
+    
+    "Emotional": [
+        "This is absolutely beautiful!",
+        "What a terrible tragedy.",
+        "I am deeply grateful for your help.",
+        "The victory was glorious!",
+        "Such a heartbreaking loss.",
+        "What an incredible achievement!",
+    ],
+    
+    "Definitions": [
+        "Democracy is a system of government.",
+        "Photosynthesis is the process by which plants make food.",
+        "A prime number is divisible only by one and itself.",
+        "The mitochondria is the powerhouse of the cell.",
+        "An algorithm is a set of instructions.",
+        "Gravity is the force of attraction between masses.",
+    ],
+    
+    "Comparisons": [
+        "The elephant is larger than the mouse.",
+        "Gold is more valuable than silver.",
+        "This method is faster but less accurate.",
+        "The new version is better than the old.",
+        "Summer is warmer than winter.",
+        "The ocean is deeper than any lake.",
+    ],
+}
+
+SENTENCE_COLORS = {
+    "Questions": "#e41a1c",
+    "Statements": "#377eb8",
+    "Commands": "#4daf4a",
+    "Narrative": "#984ea3",
+    "Technical": "#ff7f00",
+    "Emotional": "#f781bf",
+    "Definitions": "#a65628",
+    "Comparisons": "#999999",
+}
+
 # Colors for plotting (one per category)
 CATEGORY_COLORS = {
     "Concrete Nouns": "#e41a1c",
@@ -210,7 +296,7 @@ def get_valid_concepts(enc, categories=None):
 
 def load_model(ckpt_path, device='cuda'):
     """Load Walsh model from checkpoint."""
-    from src.model import Walsh, WalshConfig
+    from src.model import Walsh, WalshConfig, mHCWalsh
     
     print(f"Loading model from {ckpt_path}...")
     ckpt = torch.load(ckpt_path, map_location=device)
@@ -226,20 +312,31 @@ def load_model(ckpt_path, device='cuda'):
         else:
             clean_state[k] = v
     
-    # Get config
-    config_dict = ckpt.get('config', ckpt.get('model_args', {}))
+    # Get config - prefer model_args for architecture, config for training settings
+    model_args = ckpt.get('model_args', {})
+    config_dict = ckpt.get('config', {})
     
-    # Filter to valid config fields
+    # Use model_args for architecture config (it has correct vocab_size)
     valid_fields = ['n_layer', 'n_head', 'n_embd', 'block_size', 'vocab_size', 
                     'bias', 'dropout', 'head_mixing', 'algebra', 'hash_embeddings']
-    config_dict = {k: v for k, v in config_dict.items() if k in valid_fields}
+    arch_config = {k: v for k, v in model_args.items() if k in valid_fields}
     
     # Set vocab size if not present
-    if 'vocab_size' not in config_dict:
-        config_dict['vocab_size'] = 50257
+    if 'vocab_size' not in arch_config:
+        arch_config['vocab_size'] = 50304  # Default for padded vocab
     
-    config = WalshConfig(**config_dict)
-    model = Walsh(config)
+    config = WalshConfig(**arch_config)
+    
+    # Check if this is an mHC model
+    use_mhc = config_dict.get('use_mhc', False)
+    n_streams = config_dict.get('n_streams', 4)
+    
+    if use_mhc:
+        print(f"Loading mHCWalsh with {n_streams} streams...")
+        model = mHCWalsh(config, n_streams=n_streams)
+    else:
+        model = Walsh(config)
+    
     model.load_state_dict(clean_state)
     model.to(device)
     model.eval()
@@ -261,25 +358,55 @@ def get_hidden_states(model, enc, word, layer=-1, device='cuda'):
     token_tensor = torch.tensor([[tokens[0]]], device=device)
     
     with torch.no_grad():
-        # Get embeddings
-        h = model.tok_embeddings(token_tensor)
-        
-        # Process through layers
-        freqs_cis = model.freqs_cis[:1]
-        
-        if layer == -1:
-            # All layers
+        # Use the model's full forward pass with return_hidden=True
+        # This works for both Walsh and mHCWalsh
+        try:
+            logits, loss, hidden = model(token_tensor, return_hidden=True)
+            # hidden is [B, T, n_embd] for both model types after merging
+            return hidden[0, 0].cpu().numpy()
+        except TypeError:
+            # Fallback for models without return_hidden support
+            # Get embeddings
+            h = model.tok_embeddings(token_tensor)
+            
+            # Process through layers
+            freqs_cis = model.freqs_cis[:1]
+            
+            if layer == -1:
+                # All layers
+                for block in model.layers:
+                    h = block(h, freqs_cis)
+                h = model.norm(h)
+            else:
+                # Specific layer
+                for i, block in enumerate(model.layers):
+                    h = block(h, freqs_cis)
+                    if i == layer:
+                        break
+    
+            return h[0, 0].cpu().numpy()
+
+
+def get_sentence_embedding(model, enc, sentence, device='cuda'):
+    """Get the mean hidden state across all tokens in a sentence."""
+    tokens = enc.encode(sentence)
+    if len(tokens) == 0:
+        return None
+    
+    token_tensor = torch.tensor([tokens], device=device)
+    
+    with torch.no_grad():
+        try:
+            logits, loss, hidden = model(token_tensor, return_hidden=True)
+            # Mean pool across all tokens
+            return hidden[0].mean(dim=0).cpu().numpy()
+        except TypeError:
+            h = model.tok_embeddings(token_tensor)
+            freqs_cis = model.freqs_cis[:len(tokens)]
             for block in model.layers:
                 h = block(h, freqs_cis)
             h = model.norm(h)
-        else:
-            # Specific layer
-            for i, block in enumerate(model.layers):
-                h = block(h, freqs_cis)
-                if i == layer:
-                    break
-    
-    return h[0, 0].cpu().numpy()
+            return h[0].mean(dim=0).cpu().numpy()
 
 
 def analyze_channel_patterns(concept_states, concept_to_category, hadamard_dim=32):
@@ -304,34 +431,61 @@ def analyze_channel_patterns(concept_states, concept_to_category, hadamard_dim=3
     return category_patterns
 
 
-def plot_channel_heatmap(category_patterns, output_path='channel_analysis.png'):
-    """Plot heatmap of channel activations by category."""
+def plot_channel_heatmap(category_patterns, output_path='channel_analysis.png', sentence_patterns=None):
+    """Plot heatmap of channel activations by category, with optional sentences below."""
     categories = list(category_patterns.keys())
     hadamard_dim = len(list(category_patterns.values())[0])
     
-    # Create activation matrix
-    activation_matrix = np.array([category_patterns[cat] for cat in categories])
+    # Create activation matrix for words
+    word_matrix = np.array([category_patterns[cat] for cat in categories])
     
-    fig, axes = plt.subplots(2, 1, figsize=(16, 12))
+    # If we have sentence patterns, combine them
+    if sentence_patterns:
+        sent_categories = list(sentence_patterns.keys())
+        sent_matrix = np.array([sentence_patterns[cat] for cat in sent_categories])
+        
+        # Create combined matrix with separator row
+        separator = np.zeros((1, hadamard_dim))
+        combined_matrix = np.vstack([word_matrix, separator, sent_matrix])
+        combined_labels = categories + ['─── SENTENCES ───'] + sent_categories
+    else:
+        combined_matrix = word_matrix
+        combined_labels = categories
+    
+    fig, axes = plt.subplots(2, 1, figsize=(16, 14 if sentence_patterns else 12))
     
     # Heatmap
-    im = axes[0].imshow(activation_matrix, aspect='auto', cmap='viridis')
-    axes[0].set_yticks(range(len(categories)))
-    axes[0].set_yticklabels(categories, fontsize=8)
+    im = axes[0].imshow(combined_matrix, aspect='auto', cmap='viridis')
+    axes[0].set_yticks(range(len(combined_labels)))
+    axes[0].set_yticklabels(combined_labels, fontsize=8)
     axes[0].set_xlabel(f'Hadamard Channel (0-{hadamard_dim-1})')
     axes[0].set_ylabel('Category')
-    axes[0].set_title('Mean Activation per Hadamard Channel by Semantic Category')
+    
+    if sentence_patterns:
+        # Draw separator line
+        axes[0].axhline(y=len(categories) + 0.5, color='white', linewidth=2)
+        axes[0].set_title('Mean Activation per Hadamard Channel\n(Words above, Sentences below)')
+    else:
+        axes[0].set_title('Mean Activation per Hadamard Channel by Semantic Category')
+    
     plt.colorbar(im, ax=axes[0], label='Mean |activation|')
     
-    # Line plot
+    # Line plot - words
     for i, category in enumerate(categories):
         color = CATEGORY_COLORS.get(category, f'C{i}')
         axes[1].plot(category_patterns[category], label=category, alpha=0.7, color=color)
     
+    # Line plot - sentences (dashed)
+    if sentence_patterns:
+        for i, category in enumerate(sent_categories):
+            color = SENTENCE_COLORS.get(category, f'C{i}')
+            axes[1].plot(sentence_patterns[category], label=f'[S] {category}', 
+                        alpha=0.8, color=color, linestyle='--', linewidth=2)
+    
     axes[1].set_xlabel(f'Hadamard Channel (0-{hadamard_dim-1})')
     axes[1].set_ylabel('Mean |activation|')
     axes[1].set_title('Channel Activation Profiles by Category')
-    axes[1].legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=7)
+    axes[1].legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=6, ncol=2 if sentence_patterns else 1)
     axes[1].grid(True, alpha=0.3)
     
     plt.tight_layout()
@@ -469,6 +623,33 @@ def main():
             if sim < 0.99:  # Only print if not essentially identical
                 print(f"  {cat1[:12]:12s} - {cat2[:12]:12s}: {sim:.3f}")
     
+    # === SENTENCE ANALYSIS ===
+    print(f"\n=== Analyzing Sentences ===")
+    sentence_states = {}
+    sentence_to_category = {}
+    
+    for cat, sentences in SENTENCE_CATEGORIES.items():
+        for sent in sentences:
+            state = get_sentence_embedding(model, enc, sent, device=args.device)
+            if state is not None:
+                # Use short label for plotting
+                label = sent[:30] + "..." if len(sent) > 30 else sent
+                sentence_states[label] = state
+                sentence_to_category[label] = cat
+    
+    print(f"Got embeddings for {len(sentence_states)} sentences across {len(SENTENCE_CATEGORIES)} categories")
+    
+    # Compute sentence channel patterns
+    sentence_patterns = {}
+    for cat in SENTENCE_CATEGORIES.keys():
+        cat_sents = [s for s, c in sentence_to_category.items() if c == cat and s in sentence_states]
+        if len(cat_sents) > 0:
+            activations = np.array([sentence_states[s] for s in cat_sents])
+            # Reshape to get channel activations
+            n_blocks = activations.shape[1] // args.hadamard_dim
+            reshaped = activations.reshape(len(cat_sents), n_blocks, args.hadamard_dim)
+            sentence_patterns[cat] = np.mean(np.abs(reshaped), axis=(0, 1))
+    
     # PCA projection
     states_matrix = np.array([concept_states[c] for c in concept_states.keys()])
     pca = PCA(n_components=2)
@@ -485,8 +666,8 @@ def main():
     print(f"Between-category distance: {metrics['between_dist']:.3f}")
     print(f"Distance ratio (higher = better): {metrics['distance_ratio']:.3f}")
     
-    # Generate plots
-    plot_channel_heatmap(category_patterns, args.output)
+    # Generate plots (with sentences included)
+    plot_channel_heatmap(category_patterns, args.output, sentence_patterns=sentence_patterns)
     plot_embedding_space(concept_2d, concept_to_category, args.output)
     
     print("\nDone!")

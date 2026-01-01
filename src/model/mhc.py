@@ -643,6 +643,44 @@ class mHCWalsh(nn.Module):
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return total, trainable
+    
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Generate new tokens autoregressively.
+        
+        Args:
+            idx: [B, T] context tokens
+            max_new_tokens: number of tokens to generate
+            temperature: sampling temperature
+            top_k: top-k filtering (None = disabled)
+            
+        Returns:
+            [B, T + max_new_tokens] tensor of tokens
+        """
+        for _ in range(max_new_tokens):
+            # Crop context to block size if needed
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            
+            # Forward pass
+            logits, _ = self(idx_cond)
+            
+            # Get logits for last position
+            logits = logits[:, -1, :] / temperature
+            
+            # Optional top-k filtering
+            if top_k is not None and top_k > 0:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            
+            # Sample from distribution
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            
+            # Append to sequence
+            idx = torch.cat((idx, idx_next), dim=1)
+        
+        return idx
 
 
 # Export public API

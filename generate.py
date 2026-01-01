@@ -14,6 +14,13 @@ import torch
 import tiktoken
 from src.model import WalshConfig, Walsh
 
+# Try to import mHC model (optional)
+try:
+    from src.model.mhc import mHCWalsh
+    HAS_MHC = True
+except ImportError:
+    HAS_MHC = False
+
 # Try to import CUDA optimizations (optional)
 try:
     from src.model.cayley_dickson_cuda import optimize_for_inference
@@ -56,14 +63,23 @@ def main():
     print(f"Vocab size: {config.vocab_size}")
     print(f"Algebra: {getattr(config, 'algebra', 'octonion')} | Head mixing: {getattr(config, 'head_mixing', False)} | Hash embeddings: {getattr(config, 'hash_embeddings', False)}")
     
-    model = Walsh(config)
-    
-    # Load weights (handle compiled model prefix)
+    # Detect mHC model from checkpoint keys
     state_dict = checkpoint['model']
+    is_mhc = any('stream_proj' in k or 'H_res' in k for k in state_dict.keys())
+    
+    # Clean state dict (remove _orig_mod. prefix)
     unwanted_prefix = '_orig_mod.'
     for k, v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    
+    if is_mhc and HAS_MHC:
+        n_streams = checkpoint.get('config', {}).get('n_streams', 4)
+        print(f"Detected mHCWalsh model with {n_streams} streams")
+        model = mHCWalsh(config, n_streams=n_streams)
+    else:
+        model = Walsh(config)
+    
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
